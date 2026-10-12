@@ -150,6 +150,23 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     // where each NodeID is stored as a fixed 32-byte value.
     mapping(address => bytes32[]) private validatorNodeIDs;
 
+    // ---- Final Layer staking inflation ----
+    // Annual staking reward paid to every delegator (including the validator's
+    // own self-delegation), in basis points of the staked amount. 1200 = 12%.
+    uint256 public stakingAprBps;
+    // Extra reward paid to the validator itself, in basis points of the staking
+    // reward of its pool. 1000 = the validator earns an extra 10% on top of what
+    // its delegators earn (1.2% of the pool per year at a 12% APR).
+    uint256 public validatorRewardBps;
+    // Timestamp of the last inflation distribution.
+    uint256 public lastInflationTime;
+
+    /*----------------- Final Layer constants -----------------*/
+    uint256 public constant MAX_STAKING_APR_BPS = 2000; // 20% hard cap
+    uint256 public constant MAX_VALIDATOR_REWARD_BPS = 5000; // 50% of the pool reward
+    uint256 public constant MAX_INFLATION_PERIOD = 30 days; // cap after a long halt
+    uint256 private constant INFLATION_YEAR = 365 days;
+
     /*----------------- structs and events -----------------*/
     struct StakeMigrationPackage {
         address operatorAddress; // the operator address of the target validator to delegate to
@@ -232,6 +249,8 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     event ValidatorUnjailed(address indexed operatorAddress);
     event Claimed(address indexed operatorAddress, address indexed delegator, uint256 bnbAmount);
     event AgentChanged(address indexed operatorAddress, address indexed oldAgent, address indexed newAgent);
+    event StakingInflationDistributed(uint256 amount, uint256 elapsed);
+    event StakingInflationFailed(address indexed operatorAddress, uint256 amount);
 
     // Events for adding and removing NodeIDs.
     event NodeIDAdded(address indexed validator, bytes32 nodeID);
@@ -277,6 +296,9 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         downtimeJailTime = 2 days;
         felonyJailTime = 30 days;
         maxFelonyBetweenBreatheBlock = 2;
+        stakingAprBps = 1200;
+        validatorRewardBps = 1000;
+        lastInflationTime = block.timestamp;
         // Different address will be set depending on the environment
         __Protectable_init_unchained(0x08E68Ec70FA3b629784fDB28887e206ce8561E08);
     }
@@ -665,6 +687,87 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     }
 
     /**
+     * @notice Amount of new FL the consensus engine mints at the breathe block
+     * whose timestamp is `timestamp`, given the current state.
+     * total = stake * apr * (1 + validatorReward) * elapsed / 1 year,
+     * summed over every validator that is not jailed.
+     */
+    function pendingStakingInflation(
+        uint256 timestamp
+    ) public view returns (uint256 total) {
+        if (lastInflationTime == 0 || timestamp <= lastInflationTime || stakingAprBps == 0) return 0;
+        uint256 elapsed = timestamp - lastInflationTime;
+        if (elapsed > MAX_INFLATION_PERIOD) elapsed = MAX_INFLATION_PERIOD;
+        uint256 base = _inflationBase();
+        total = (base * stakingAprBps * (10_000 + validatorRewardBps) * elapsed) / (100_000_000 * INFLATION_YEAR);
+    }
+
+    /**
+     * @dev Called by the consensus engine once per breathe block (daily) with the
+     * newly minted inflation as msg.value. It never reverts: if a pool cannot
+     * accept its share, the share stays in this contract.
+     * Each validator pool receives a share proportional to its stake. The
+     * delegators' part is added to the pool (raising the share price, so every
+     * delegator earns the APR); the validator part is minted to the validator as
+     * commission shares.
+     */
+    function distributeStakingInflation() external payable onlyCoinbase onlyZeroGasPrice {
+        uint256 elapsed = lastInflationTime == 0 ? 0 : block.timestamp - lastInflationTime;
+        lastInflationTime = block.timestamp;
+        uint256 amount = msg.value;
+        emit StakingInflationDistributed(amount, elapsed);
+        if (amount == 0) return;
+
+        uint256 length = _validatorSet.length();
+        uint256[] memory weights = new uint256[](length);
+        uint256 totalWeight;
+        for (uint256 i; i < length; ++i) {
+            Validator memory valInfo = _validators[_validatorSet.at(i)];
+            if (valInfo.jailed || valInfo.creditContract == address(0)) continue;
+            weights[i] = IStakeCredit(valInfo.creditContract).totalPooledBNB();
+            totalWeight += weights[i];
+        }
+        if (totalWeight == 0) return;
+
+        uint256 remaining = amount;
+        uint256 denominator = 10_000 + validatorRewardBps;
+        for (uint256 i; i < length; ++i) {
+            if (weights[i] == 0) continue;
+            uint256 share = (amount * weights[i]) / totalWeight;
+            if (share > remaining) share = remaining;
+            remaining -= share;
+            if (share == 0) continue;
+
+            address operatorAddress = _validatorSet.at(i);
+            address credit = _validators[operatorAddress].creditContract;
+            uint256 validatorPart = (share * validatorRewardBps) / denominator;
+            uint256 stakerPart = share - validatorPart;
+            if (stakerPart > 0) {
+                try IStakeCredit(credit).distributeReward{ value: stakerPart }(0) { }
+                catch {
+                    emit StakingInflationFailed(operatorAddress, stakerPart);
+                }
+            }
+            if (validatorPart > 0) {
+                try IStakeCredit(credit).distributeReward{ value: validatorPart }(10_000) { }
+                catch {
+                    emit StakingInflationFailed(operatorAddress, validatorPart);
+                }
+            }
+            try IGovToken(GOV_TOKEN_ADDR).sync(credit, operatorAddress) { } catch { }
+        }
+    }
+
+    function _inflationBase() internal view returns (uint256 base) {
+        uint256 length = _validatorSet.length();
+        for (uint256 i; i < length; ++i) {
+            Validator memory valInfo = _validators[_validatorSet.at(i)];
+            if (valInfo.jailed || valInfo.creditContract == address(0)) continue;
+            base += IStakeCredit(valInfo.creditContract).totalPooledBNB();
+        }
+    }
+
+    /**
      * @dev Downtime slash. Only the `SlashIndicator` contract can call this function.
      */
     function downtimeSlash(
@@ -831,6 +934,16 @@ contract StakeHub is SystemV2, Initializable, Protectable {
             address newStakeHubProtector = value.bytesToAddress(20);
             if (newStakeHubProtector == address(0)) revert InvalidValue(key, value);
             _setProtector(newStakeHubProtector);
+        } else if (key.compareStrings("stakingAprBps")) {
+            if (value.length != 32) revert InvalidValue(key, value);
+            uint256 newStakingAprBps = value.bytesToUint256(32);
+            if (newStakingAprBps > MAX_STAKING_APR_BPS) revert InvalidValue(key, value);
+            stakingAprBps = newStakingAprBps;
+        } else if (key.compareStrings("validatorRewardBps")) {
+            if (value.length != 32) revert InvalidValue(key, value);
+            uint256 newValidatorRewardBps = value.bytesToUint256(32);
+            if (newValidatorRewardBps > MAX_VALIDATOR_REWARD_BPS) revert InvalidValue(key, value);
+            validatorRewardBps = newValidatorRewardBps;
         } else if (key.compareStrings("maxNodeIDs")) {
             if (value.length != 32) revert InvalidValue(key, value);
             uint256 newMaxNodeIDs = value.bytesToUint256(32);
@@ -1188,35 +1301,17 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         return true;
     }
 
+    /**
+     * @dev Final Layer has no BLS fast finality. The vote address is kept only as
+     * an opaque 48 byte validator identifier (it must be unique); no BLS
+     * proof-of-possession is verified and the proof argument must be empty.
+     */
     function _checkVoteAddress(
-        address operatorAddress,
+        address,
         bytes calldata voteAddress,
         bytes calldata blsProof
-    ) internal view returns (bool) {
-        if (voteAddress.length != BLS_PUBKEY_LENGTH || blsProof.length != BLS_SIG_LENGTH) {
-            return false;
-        }
-
-        // get msg hash
-        bytes32 msgHash = keccak256(abi.encodePacked(operatorAddress, voteAddress, block.chainid));
-        bytes memory msgBz = new bytes(32);
-        assembly {
-            mstore(add(msgBz, 32), msgHash)
-        }
-
-        // call the precompiled contract to verify the BLS signature
-        // the precompiled contract's address is 0x66
-        bytes memory input = bytes.concat(msgBz, blsProof, voteAddress); // length: 32 + 96 + 48 = 176
-        bytes memory output = new bytes(1);
-        assembly {
-            let len := mload(input)
-            if iszero(staticcall(not(0), 0x66, add(input, 0x20), len, add(output, 0x20), 0x01)) { revert(0, 0) }
-        }
-        uint8 result = uint8(output[0]);
-        if (result != uint8(1)) {
-            return false;
-        }
-        return true;
+    ) internal pure returns (bool) {
+        return voteAddress.length == BLS_PUBKEY_LENGTH && blsProof.length == 0;
     }
 
     function _deployStakeCredit(address operatorAddress, string memory moniker) internal returns (address) {
