@@ -7,6 +7,10 @@ import "../contracts/StakeHub.sol";
 // Final Layer staking inflation: the system transaction that distributes the
 // daily inflation is gas metered and counted in header.GasUsed, so its cost
 // must stay bounded no matter how many validators register.
+interface VmCool {
+    function cool(address target) external;
+}
+
 contract FinalLayerInflationTest is Test {
     address payable constant VALIDATOR_CONTRACT_ADDR = payable(0x0000000000000000000000000000000000001000);
     address payable constant STAKE_HUB_ADDR = payable(0x0000000000000000000000000000000000002002);
@@ -436,10 +440,11 @@ contract FinalLayerInflationTest is Test {
     // R2-07: governance cannot leave elected validators without inflation or
     // lower the self delegation below the launch value.
     function testGovernanceBounds() public {
+        uint256 maxElected = stakeHub.MAX_INFLATION_VALIDATORS();
         vm.startPrank(GOV_HUB_ADDR);
         vm.expectRevert();
-        stakeHub.updateParam("maxElectedValidators", abi.encode(uint256(101)));
-        stakeHub.updateParam("maxElectedValidators", abi.encode(uint256(100)));
+        stakeHub.updateParam("maxElectedValidators", abi.encode(maxElected + 1));
+        stakeHub.updateParam("maxElectedValidators", abi.encode(maxElected));
         vm.expectRevert();
         stakeHub.updateParam("minSelfDelegationBNB", abi.encode(uint256(99_999 ether)));
         stakeHub.updateParam("minSelfDelegationBNB", abi.encode(uint256(200_000 ether)));
@@ -503,7 +508,162 @@ contract FinalLayerInflationTest is Test {
             / (100_000_000 * 365 days);
         assertEq(amount, capped);
         uint256 gasUsed = _distribute(amount);
-        emit log_named_uint("distributeStakingInflation gas, 120 elected (capped at 100)", gasUsed);
+        emit log_named_uint("distributeStakingInflation gas, 120 elected (capped at MAX_INFLATION_VALIDATORS)", gasUsed);
         assertEq(_pooled(119), 100_001 ether);
+    }
+
+    // Worst case breathe block system txs at the largest
+    // allowed elected set. Inflation: every snapshot pool has a failed payout to
+    // retry, is paid again, then re-snapshotted. Validator update: the set grows
+    // to its maximum with all new addresses (fresh storage). Both must fit their
+    // own reserve (15M inflation, 20M SystemTxsGasHardLimit), and together the
+    // 40M block gas limit with room for deposit/slash.
+    function _worstCaseDistributeGas(uint256 n) internal returns (uint256 gasUsed) {
+        for (uint256 i; i < n; ++i) {
+            _createValidator();
+        }
+        _setElected(consensusAddrs);
+        _breathe();
+        vm.warp(block.timestamp + 1 days);
+        for (uint256 i; i < n; ++i) {
+            vm.mockCallRevert(
+                stakeHub.getValidatorCreditContract(operators[i]),
+                abi.encodeWithSelector(IStakeCredit.distributeReward.selector),
+                "down"
+            );
+        }
+        _distribute(stakeHub.pendingStakingInflation(block.timestamp));
+        vm.clearMockedCalls();
+        _setElected(consensusAddrs);
+        assertGt(stakeHub.pendingStakerInflation(operators[n - 1]), 0);
+        vm.warp(block.timestamp + 1 days);
+        uint256 amount = stakeHub.pendingStakingInflation(block.timestamp);
+        gasUsed = _distribute(amount);
+        emit log_named_uint("worst case distributeStakingInflation gas (pools + retries)", gasUsed);
+        assertEq(stakeHub.pendingStakerInflation(operators[n - 1]), 0);
+    }
+
+    function _updateValidatorSetGas(uint256 n) internal returns (uint256 maxUsed) {
+        vm.mockCall(address(0x1001), abi.encodeWithSignature("clean()"), "");
+        for (uint256 round; round < 2; ++round) {
+            address[] memory addrs = new address[](n);
+            uint64[] memory powers = new uint64[](n);
+            bytes[] memory votes = new bytes[](n);
+            for (uint256 i; i < n; ++i) {
+                addrs[i] = address(uint160(uint256(keccak256(abi.encode("val", round, i)))));
+                powers[i] = 100_000 * 1e8;
+                votes[i] = _voteId(addrs[i]);
+            }
+            vm.prank(coinbase);
+            uint256 g = gasleft();
+            (bool ok, bytes memory ret) = VALIDATOR_CONTRACT_ADDR.call(
+                abi.encodeWithSignature("updateValidatorSetV2(address[],uint64[],bytes[])", addrs, powers, votes)
+            );
+            uint256 used = g - gasleft();
+            assertTrue(ok, string(ret));
+            emit log_named_uint("updateValidatorSetV2 gas", used);
+            if (used > maxUsed) maxUsed = used;
+        }
+    }
+
+    function testBreatheBlockGasAtMaxElected() public {
+        uint256 n = stakeHub.MAX_INFLATION_VALIDATORS();
+        uint256 d = _worstCaseDistributeGas(n);
+        uint256 u = _updateValidatorSetGas(n);
+        emit log_named_uint("breathe block system gas at max elected (update + inflation)", d + u);
+        assertLt(d, 15_000_000, "inflation exceeds stakingInflationReservedGas");
+        assertLt(u, SYSTEM_TXS_GAS_HARD_LIMIT, "validator update exceeds SystemTxsGasHardLimit");
+        assertLt(d + u, 30_000_000, "breathe block system txs too close to the 40M gas limit");
+    }
+
+    // ---------------- consensus key rotation (R2-04) ----------------
+
+    address constant SLASH_ADDR = 0x0000000000000000000000000000000000001001;
+
+    function _rotate(uint256 i, uint256 seed) internal returns (address newConsensus) {
+        bytes memory pk = _fakePubKey(seed);
+        newConsensus = _consensusOf(pk);
+        _acceptPop(pk, newConsensus, operators[i]);
+        vm.prank(operators[i]);
+        stakeHub.editConsensusAddress(newConsensus, _proof(pk));
+    }
+
+    // With R2-04 the old key cannot seal from the block after the edit, and the
+    // new key only joins Parlia's validator set after the next breathe block and
+    // epoch. With 3 validators the Parlia recents rule needs 2 live signers, so a
+    // second rotation in that window halts the chain for good (no block can reach
+    // the breathe block that would install the new keys).
+    function testRotationCannotHaltChain() public {
+        for (uint256 i; i < 3; ++i) {
+            _createValidator();
+        }
+        _setElected(consensusAddrs);
+        vm.warp(block.timestamp + 2 days);
+        _rotate(0, 5000);
+        vm.expectRevert(StakeHub.TooManyPendingRotations.selector);
+        this.rotateExternal(1, 5001);
+        // once the first rotation is in Parlia's validator set, the next one may go
+        vm.warp(block.timestamp + stakeHub.ROTATION_SETTLE_TIME());
+        _rotate(1, 5001);
+    }
+
+    function rotateExternal(uint256 i, uint256 seed) external {
+        _rotate(i, seed);
+    }
+
+    // A validator whose old key was revoked cannot produce until the next
+    // breathe block; it must not be downtime slashed and jailed for that.
+    function testRotatedValidatorNotDowntimeJailed() public {
+        for (uint256 i; i < 3; ++i) {
+            _createValidator();
+        }
+        _setElected(consensusAddrs);
+        vm.etch(SLASH_ADDR, vm.getDeployedCode("SlashIndicator.sol:SlashIndicator"));
+        (bool ok,) = SLASH_ADDR.call(abi.encodeWithSignature("init()"));
+        assertTrue(ok);
+        vm.mockCall(VALIDATOR_CONTRACT_ADDR, abi.encodeWithSignature("isCurrentValidator(address)"), abi.encode(true));
+        vm.mockCall(VALIDATOR_CONTRACT_ADDR, abi.encodeWithSignature("felony(address)"), "");
+        vm.mockCall(VALIDATOR_CONTRACT_ADDR, abi.encodeWithSignature("misdemeanor(address)"), "");
+        vm.warp(block.timestamp + 2 days);
+        _rotate(0, 5000);
+        // the old key misses every in-turn slot until the breathe block (thousands per day)
+        for (uint256 i; i < 150; ++i) {
+            vm.roll(block.number + 1);
+            vm.prank(coinbase);
+            (ok,) = SLASH_ADDR.call(abi.encodeWithSignature("slash(address)", consensusAddrs[0]));
+            assertTrue(ok);
+        }
+        (, bool jailed,) = stakeHub.getValidatorBasicInfo(operators[0]);
+        assertFalse(jailed, "honest key rotation got the validator downtime jailed");
+        // an offline validator that did not rotate is still jailed
+        for (uint256 i; i < 150; ++i) {
+            vm.roll(block.number + 1);
+            vm.prank(coinbase);
+            (ok,) = SLASH_ADDR.call(abi.encodeWithSignature("slash(address)", consensusAddrs[1]));
+            assertTrue(ok);
+        }
+        (, jailed,) = stakeHub.getValidatorBasicInfo(operators[1]);
+        assertTrue(jailed);
+    }
+
+    // The downtime exemption must not let an offline validator keep earning by
+    // rotating its key every day: a pool whose key was rotated after the
+    // snapshot forfeits that distribution (it is carried to the others).
+    function testRotationForfeitsThatDaysInflation() public {
+        for (uint256 i; i < 3; ++i) {
+            _createValidator();
+        }
+        _setElected(consensusAddrs);
+        vm.warp(block.timestamp + 2 days);
+        _breathe();
+        _rotate(0, 5000);
+        vm.warp(block.timestamp + 1 days);
+        uint256 amount = stakeHub.pendingStakingInflation(block.timestamp);
+        uint256 before0 = _pooled(0);
+        uint256 before1 = _pooled(1);
+        _distribute(amount);
+        assertEq(_pooled(0), before0, "rotated (non-producing) pool still earned");
+        assertGt(_pooled(1), before1);
+        assertApproxEqAbs(stakeHub.inflationCarry(), amount / 3, 3);
     }
 }

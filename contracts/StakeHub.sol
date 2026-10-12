@@ -36,6 +36,7 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     /*----------------- errors -----------------*/
     // @notice signature: 0x5f28f62b
     error TooManyValidators();
+    error TooManyPendingRotations();
     error ValidatorExisted();
     // @notice signature: 0x056e8811
     error ValidatorNotExisted();
@@ -180,15 +181,30 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     address[] internal _inflationCredits;
     uint256[] internal _inflationWeights;
     uint256 public inflationWeightTotal;
+    // Time of each operator's last editConsensusAddress. Until the new key is in
+    // Parlia's validator set the validator cannot seal (the node rejects the old
+    // key at once), so concurrent rotations are bounded to keep the chain live,
+    // and a pool rotated after the inflation snapshot forfeits that distribution.
+    mapping(address => uint256) public consensusRotatedAt;
+    // Timestamp of the block that took the current inflation snapshot.
+    uint256 public inflationSnapshotTime;
 
     /*----------------- Final Layer constants -----------------*/
     uint256 public constant MAX_STAKING_APR_BPS = 2000; // 20% hard cap
     uint256 public constant MAX_VALIDATOR_REWARD_BPS = 5000; // 50% of the pool reward
     uint256 public constant MAX_INFLATION_PERIOD = 30 days; // cap after a long halt
-    uint256 public constant MAX_INFLATION_VALIDATORS = 100; // bounds the breathe block system tx gas
+    // Bounds the breathe block system txs: at 50 the worst case (validator update
+    // growing the set + inflation with retries for every pool) is ~23.3M gas of
+    // the 35M reserved on a 40M gas block; at 100 it is ~47M, over the block gas
+    // limit, so no breathe block could be built (FinalLayerInflation.t.sol).
+    uint256 public constant MAX_INFLATION_VALIDATORS = 50;
     // Bounds the daily election read, which scans every registered validator.
     uint256 public constant MAX_REGISTERED_VALIDATORS = 500;
     uint256 public constant MIN_SELF_DELEGATION_FLOOR = 100_000 ether;
+    // Upper bound on the time from editConsensusAddress until Parlia seals with
+    // the new key: the next breathe block (<= 1 day) installs it in the
+    // validator set and the following epoch block (1000 blocks) in Parlia.
+    uint256 public constant ROTATION_SETTLE_TIME = 1 days + 4 hours;
     address private constant PQ_VERIFY_PRECOMPILE = address(0x0f01);
     uint8 private constant PQ_SCHEME_MLDSA87 = 0x01;
     uint256 private constant PQ_PUBKEY_LENGTH = 2592;
@@ -461,7 +477,9 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         }
         Validator storage valInfo = _validators[operatorAddress];
         if (valInfo.updateTime + BREATHE_BLOCK_INTERVAL > block.timestamp) revert UpdateTooFrequently();
+        _checkRotationLiveness(operatorAddress);
 
+        consensusRotatedAt[operatorAddress] = block.timestamp;
         consensusExpiration[valInfo.consensusAddress] = block.timestamp;
         valInfo.consensusAddress = newConsensusAddress;
         valInfo.updateTime = block.timestamp;
@@ -475,6 +493,34 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         emit VoteAddressEdited(operatorAddress, newVoteAddress);
 
         emit ConsensusAddressEdited(operatorAddress, newConsensusAddress);
+    }
+
+    /**
+     * @dev The node rejects blocks sealed by a replaced consensus key from the
+     * next block on, while the new key only seals once the next breathe block and
+     * epoch have put it in Parlia's validator set. Parlia needs floor(n/2)+1 of
+     * the n current validators able to seal (recents rule), so a rotation of a
+     * current validator is refused if it would leave fewer than that, counting
+     * the rotations that have not settled yet.
+     */
+    function _checkRotationLiveness(
+        address operatorAddress
+    ) internal view {
+        address[] memory current = IBSCValidatorSet(VALIDATOR_CONTRACT_ADDR).getValidators();
+        uint256 n = current.length;
+        bool isCurrent;
+        uint256 pending;
+        for (uint256 i; i < n; ++i) {
+            address op = consensusToOperator[current[i]];
+            if (op == address(0)) continue;
+            if (op == operatorAddress) {
+                isCurrent = true;
+                continue;
+            }
+            uint256 rotatedAt = consensusRotatedAt[op];
+            if (rotatedAt != 0 && rotatedAt + ROTATION_SETTLE_TIME > block.timestamp) ++pending;
+        }
+        if (isCurrent && n < pending + 1 + n / 2 + 1) revert TooManyPendingRotations();
     }
 
     /**
@@ -795,6 +841,11 @@ contract StakeHub is SystemV2, Initializable, Protectable {
                 address operatorAddress = _inflationOperators[i];
                 // a pool jailed since the snapshot does not earn; its share is carried
                 if (_validators[operatorAddress].jailed) continue;
+                // nor does one whose consensus key was rotated since (it could not
+                // seal until the new key was installed, and is exempt from downtime
+                // slashing for that time)
+                uint256 rotatedAt = consensusRotatedAt[operatorAddress];
+                if (rotatedAt != 0 && rotatedAt >= inflationSnapshotTime) continue;
                 remaining -= share;
                 uint256 validatorPart = (share * validatorRewardBps) / denominator;
                 _payInflation(operatorAddress, _inflationCredits[i], share - validatorPart, validatorPart);
@@ -874,6 +925,7 @@ contract StakeHub is SystemV2, Initializable, Protectable {
             total += weight;
         }
         inflationWeightTotal = total;
+        inflationSnapshotTime = block.timestamp;
     }
 
     /**

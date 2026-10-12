@@ -6,6 +6,7 @@ interface IStakeHub {
     function doubleSignSlash(address validator) external;
     function voteToOperator(bytes calldata voteAddress) external view returns (address);
     function consensusToOperator(address validator) external view returns (address);
+    function consensusExpiration(address validator) external view returns (uint256);
     function getValidatorConsensusAddress(address validator) external view returns (address);
     function getValidatorCreditContract(address validator) external view returns (address);
     function getValidatorVoteAddress(address validator) external view returns (bytes memory);

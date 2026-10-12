@@ -112,6 +112,12 @@ contract SlashIndicator is ISlashIndicator, System, IParamSubscriber, IApplicati
         if (!IBSCValidatorSet(VALIDATOR_CONTRACT_ADDR).isCurrentValidator(validator)) {
             return;
         }
+        // Final Layer: a consensus key replaced through StakeHub.editConsensusAddress
+        // may not seal any more (the node rejects it), and the new key only seals
+        // after the next breathe block. Those missed slots are not downtime.
+        if (IStakeHub(STAKE_HUB_ADDR).consensusExpiration(validator) != 0) {
+            return;
+        }
         Indicator memory indicator = indicators[validator];
         if (indicator.exist) {
             ++indicator.count;
