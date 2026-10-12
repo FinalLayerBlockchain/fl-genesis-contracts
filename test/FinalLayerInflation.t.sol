@@ -405,25 +405,23 @@ contract FinalLayerInflationTest is Test {
         assertEq(ops[0], operators[1]);
     }
 
-    // FL-11: after a halt longer than 30 days the missed time is paid on the
-    // following breathe blocks instead of being forfeited.
-    function testLongHaltIsCaughtUp() public {
+    // FL-11 / R4-02: after a long halt the whole backlog is paid at the first
+    // breathe block, to the snapshot it was earned under (an election at
+    // recovery cannot take earlier rewards).
+    function testLongHaltPaidAtOnce() public {
         _createValidator();
         _setElected(consensusAddrs);
         _breathe();
-        uint256 start = stakeHub.lastInflationTime();
-        vm.warp(start + 60 days);
+        vm.warp(stakeHub.lastInflationTime() + 90 days);
         uint256 stake = 100_001 ether;
-        uint256 perDay = (stake * 1200 * 11_000 * 1 days) / (100_000_000 * 365 days);
-        uint256 first = stakeHub.pendingStakingInflation(block.timestamp);
-        _distribute(first);
-        assertEq(stakeHub.lastInflationTime(), start + 30 days);
-        uint256 second = stakeHub.pendingStakingInflation(block.timestamp);
-        _distribute(second);
-        assertEq(stakeHub.lastInflationTime(), start + 60 days);
-        // the second catch-up pays on the grown (compounded) snapshot, so allow ~1.5%
-        assertApproxEqRel(first + second, perDay * 60, 2e16);
-        assertGe(first + second, perDay * 60);
+        uint256 expected = (stake * 1200 * 11_000 * 90 days) / (100_000_000 * 365 days);
+        uint256 amount = stakeHub.pendingStakingInflation(block.timestamp);
+        assertEq(amount, expected);
+        uint256 before = _pooled(0);
+        _distribute(amount);
+        assertApproxEqAbs(_pooled(0) - before, amount, 2);
+        assertEq(stakeHub.lastInflationTime(), block.timestamp);
+        assertEq(stakeHub.pendingStakingInflation(block.timestamp), 0);
     }
 
     // FL-12: a rate change only applies from the moment it is made.
@@ -608,9 +606,57 @@ contract FinalLayerInflationTest is Test {
         _rotate(0, 5000);
         vm.expectRevert(StakeHub.TooManyPendingRotations.selector);
         this.rotateExternal(1, 5001);
-        // once the first rotation is in Parlia's validator set, the next one may go
-        vm.warp(block.timestamp + stakeHub.ROTATION_SETTLE_TIME());
+        // the first rotation counts until a breathe block has put its new key in
+        // the elected set and Parlia's epoch has installed it (the election of a
+        // breathe block reads the parent state, so it must come in a later block)
+        vm.roll(block.number + 1);
+        _breathe();
+        vm.expectRevert(StakeHub.RotationFrozen.selector);
+        this.rotateExternal(1, 5001);
+        vm.roll(block.number + stakeHub.ROTATION_FREEZE_BLOCKS() + 1);
+        vm.warp(block.timestamp + 2 days);
         _rotate(1, 5001);
+    }
+
+    // R4-01: right after a breathe block the contract's elected set and
+    // Parlia's set can differ, so rotations wait for the epoch to install it.
+    function testRotationFrozenAfterElection() public {
+        for (uint256 i; i < 3; ++i) {
+            _createValidator();
+        }
+        _setElected(consensusAddrs);
+        vm.warp(block.timestamp + 2 days);
+        _breathe();
+        vm.expectRevert(StakeHub.RotationFrozen.selector);
+        this.rotateExternal(0, 5000);
+        vm.roll(block.number + stakeHub.ROTATION_FREEZE_BLOCKS() + 1);
+        _rotate(0, 5000);
+    }
+
+    // R4-03: when no snapshot pool earns, the inflation is burned, not carried
+    // (the carry could pay it back to the forfeiting pools later).
+    function testNoEligiblePoolBurns() public {
+        for (uint256 i; i < 3; ++i) {
+            _createValidator();
+        }
+        _setElected(consensusAddrs);
+        vm.warp(block.timestamp + 2 days);
+        _breathe();
+        // pools 1 and 2 jailed (the last validator can never be jailed), pool 0
+        // rotated after the snapshot: no pool earns this distribution
+        vm.startPrank(0x0000000000000000000000000000000000001001); // SlashIndicator
+        stakeHub.downtimeSlash(consensusAddrs[1]);
+        stakeHub.downtimeSlash(consensusAddrs[2]);
+        vm.stopPrank();
+        vm.roll(block.number + stakeHub.ROTATION_FREEZE_BLOCKS() + 1);
+        _rotate(0, 5000);
+        vm.warp(block.timestamp + 1 days);
+        uint256 amount = stakeHub.pendingStakingInflation(block.timestamp);
+        assertGt(amount, 0);
+        uint256 deadBefore = address(0xdEaD).balance;
+        _distribute(amount);
+        assertEq(address(0xdEaD).balance - deadBefore, amount, "forfeited inflation not burned");
+        assertEq(stakeHub.inflationCarry(), 0);
     }
 
     function rotateExternal(uint256 i, uint256 seed) external {
@@ -662,6 +708,7 @@ contract FinalLayerInflationTest is Test {
         _setElected(consensusAddrs);
         vm.warp(block.timestamp + 2 days);
         _breathe();
+        vm.roll(block.number + stakeHub.ROTATION_FREEZE_BLOCKS() + 1);
         _rotate(0, 5000);
         vm.warp(block.timestamp + 1 days);
         uint256 amount = stakeHub.pendingStakingInflation(block.timestamp);
@@ -746,19 +793,21 @@ contract FinalLayerInflationTest is Test {
         _rotate(0, 5000);
     }
 
-    // Regression: a rate change in the breathe block during post-halt catch-up
-    // books the whole backlog; the part the (capped) mint did not cover stays.
+    // Regression: a rate change in the breathe block after a long halt; the
+    // parent-state mint covers the whole backlog and nothing is lost or left.
     function testBacklogNotLostOnSameBlockRateChange() public {
         _createValidator();
         _setElected(consensusAddrs);
         _breathe();
         vm.warp(block.timestamp + 60 days);
-        uint256 minted = stakeHub.pendingStakingInflation(block.timestamp); // parent view: 30 days
+        uint256 minted = stakeHub.pendingStakingInflation(block.timestamp); // parent view
         vm.prank(GOV_HUB_ADDR);
         stakeHub.updateParam("stakingAprBps", abi.encode(uint256(1500)));
+        uint256 before = _pooled(0);
         _distribute(minted);
         uint256 stake = 100_001 ether;
-        uint256 thirtyDays = (stake * 1200 * 11_000 * 30 days) / (100_000_000 * 365 days);
-        assertApproxEqAbs(stakeHub.accruedInflation(), thirtyDays, 4, "backlog beyond the mint was lost");
+        uint256 sixtyDays = (stake * 1200 * 11_000 * 60 days) / (100_000_000 * 365 days);
+        assertApproxEqAbs(_pooled(0) - before, sixtyDays, 4);
+        assertEq(stakeHub.accruedInflation(), 0);
     }
 }

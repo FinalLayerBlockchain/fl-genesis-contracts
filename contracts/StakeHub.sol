@@ -43,6 +43,7 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     // @notice signature: 0x5f28f62b
     error TooManyValidators();
     error TooManyPendingRotations();
+    error RotationFrozen();
     error ValidatorExisted();
     // @notice signature: 0x056e8811
     error ValidatorNotExisted();
@@ -166,9 +167,7 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     // reward of its pool. 1000 = the validator earns an extra 10% on top of what
     // its delegators earn (1.2% of the pool per year at a 12% APR).
     uint256 public validatorRewardBps;
-    // Inflation is paid up to this timestamp. After a halt longer than
-    // MAX_INFLATION_PERIOD it advances only by the time actually paid, so the
-    // missed time is caught up on the following breathe blocks.
+    // Inflation is paid up to this timestamp.
     uint256 public lastInflationTime;
     // Inflation accrued at the previous rates when a rate is changed by
     // governance, paid at the next breathe block (rates never apply backwards).
@@ -197,11 +196,15 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     // The validator-bonus part of accruedInflation, so a later change of
     // validatorRewardBps does not re-split rewards that were already earned.
     uint256 public accruedValidatorInflation;
+    // Block of the last breathe block (the elected set changes there and becomes
+    // Parlia's set at the following epoch block).
+    uint256 public lastValidatorSetUpdateBlock;
+    // Block of each operator's last editConsensusAddress.
+    mapping(address => uint256) public consensusRotatedBlock;
 
     /*----------------- Final Layer constants -----------------*/
     uint256 public constant MAX_STAKING_APR_BPS = 2000; // 20% hard cap
     uint256 public constant MAX_VALIDATOR_REWARD_BPS = 5000; // 50% of the pool reward
-    uint256 public constant MAX_INFLATION_PERIOD = 30 days; // cap after a long halt
     // Bounds the breathe block system txs: at 50 the worst case (validator update
     // growing the set + inflation with retries for every pool) is ~23.3M gas of
     // the 35M reserved on a 40M gas block; at 100 it is ~47M, over the block gas
@@ -210,10 +213,10 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     // Bounds the daily election read, which scans every registered validator.
     uint256 public constant MAX_REGISTERED_VALIDATORS = 500;
     uint256 public constant MIN_SELF_DELEGATION_FLOOR = 100_000 ether;
-    // Upper bound on the time from editConsensusAddress until Parlia seals with
-    // the new key: the next breathe block (<= 1 day) installs it in the
-    // validator set and the following epoch block (1000 blocks) in Parlia.
-    uint256 public constant ROTATION_SETTLE_TIME = 1 days + 4 hours;
+    // After a breathe block the contract's elected set and Parlia's set differ
+    // until the next epoch block (1000 blocks) plus len/2 blocks; rotations are
+    // frozen for that window so the liveness check sees Parlia's set.
+    uint256 public constant ROTATION_FREEZE_BLOCKS = 1100;
     // A current validator that missed its turn within this many blocks counts
     // as offline for the rotation liveness check (SlashIndicator records the
     // block of every missed turn).
@@ -495,6 +498,7 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         _checkRotationLiveness(operatorAddress);
 
         consensusRotatedAt[operatorAddress] = block.timestamp;
+        consensusRotatedBlock[operatorAddress] = block.number;
         consensusExpiration[valInfo.consensusAddress] = block.timestamp;
         valInfo.consensusAddress = newConsensusAddress;
         valInfo.updateTime = block.timestamp;
@@ -521,6 +525,11 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     function _checkRotationLiveness(
         address operatorAddress
     ) internal view {
+        // Until Parlia has installed the set elected at the last breathe block,
+        // the contract cannot tell which keys Parlia lets seal: no rotations.
+        if (lastValidatorSetUpdateBlock != 0 && block.number <= lastValidatorSetUpdateBlock + ROTATION_FREEZE_BLOCKS) {
+            revert RotationFrozen();
+        }
         IBSCValidatorSet vs = IBSCValidatorSet(VALIDATOR_CONTRACT_ADDR);
         address[] memory current = vs.getValidators();
         // Parlia's quorum is over the set it took at the last epoch block. That
@@ -542,10 +551,12 @@ contract StakeHub is SystemV2, Initializable, Protectable {
                 isCurrent = true;
                 continue;
             }
-            // a rotation that has not settled yet: that validator cannot seal
+            // a rotation whose new key Parlia has not installed yet: a breathe block
+            // after the rotation and then its epoch (outside the freeze) must have
+            // passed, measured in blocks, not time
             if (op != address(0)) {
-                uint256 rotatedAt = consensusRotatedAt[op];
-                if (rotatedAt != 0 && rotatedAt + ROTATION_SETTLE_TIME > block.timestamp) {
+                uint256 rotatedBlock = consensusRotatedBlock[op];
+                if (rotatedBlock != 0 && rotatedBlock >= lastValidatorSetUpdateBlock) {
                     ++unavailable;
                     continue;
                 }
@@ -807,7 +818,8 @@ contract StakeHub is SystemV2, Initializable, Protectable {
      * snapshotStake is the stake of the working (elected, not jailed) validators
      * taken at the previous breathe block, so it depends only on state written
      * by the previous distribution and by governance, never on transactions of
-     * the breathe block itself. elapsed is capped at MAX_INFLATION_PERIOD.
+     * the breathe block itself. The whole unpaid time is included, also after
+     * a long halt, and paid to the snapshot the stake earned it under.
      */
     function pendingStakingInflation(
         uint256 timestamp
@@ -820,7 +832,6 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     function _inflationFor(
         uint256 elapsed
     ) internal view returns (uint256) {
-        if (elapsed > MAX_INFLATION_PERIOD) elapsed = MAX_INFLATION_PERIOD;
         return (inflationWeightTotal * stakingAprBps * (10_000 + validatorRewardBps) * elapsed)
             / (100_000_000 * INFLATION_YEAR);
     }
@@ -832,7 +843,7 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     function _checkpointInflation() internal {
         if (lastInflationTime == 0 || block.timestamp <= lastInflationTime) return;
         // All unpaid time is booked at the rates in force while it passed,
-        // including a backlog longer than MAX_INFLATION_PERIOD after a halt.
+        // including the backlog of a long halt.
         uint256 elapsed = block.timestamp - lastInflationTime;
         uint256 amount = (inflationWeightTotal * stakingAprBps * (10_000 + validatorRewardBps) * elapsed)
             / (100_000_000 * INFLATION_YEAR);
@@ -854,13 +865,15 @@ contract StakeHub is SystemV2, Initializable, Protectable {
      * validators.
      */
     function distributeStakingInflation() external payable onlyCoinbase onlyZeroGasPrice {
+        // The whole unpaid time is settled at once, by the snapshot the stake was
+        // earning under (no installments: an election in between must not move
+        // earlier rewards to the newly elected pools).
         uint256 elapsed;
         if (lastInflationTime != 0 && block.timestamp > lastInflationTime) {
             elapsed = block.timestamp - lastInflationTime;
-            if (elapsed > MAX_INFLATION_PERIOD) elapsed = MAX_INFLATION_PERIOD;
         }
-        if (lastInflationTime == 0) lastInflationTime = block.timestamp;
-        else lastInflationTime += elapsed;
+        lastInflationTime = block.timestamp;
+        lastValidatorSetUpdateBlock = block.number;
         // The part of msg.value that was booked at earlier rates keeps the
         // staker/validator split it was earned with.
         uint256 accPart = accruedInflation < msg.value ? accruedInflation : msg.value;
@@ -903,6 +916,12 @@ contract StakeHub is SystemV2, Initializable, Protectable {
                 if (validatorPart > share) validatorPart = share;
                 _payInflation(operatorAddress, _inflationCredits[i], share - validatorPart, validatorPart);
             }
+        }
+        if (eligibleTotal == 0 && remaining > 0) {
+            // No pool earns this time: the inflation is forfeited for good (burned),
+            // so it cannot flow back to the forfeiting pools through the carry.
+            (bool burned,) = DEAD_ADDRESS.call{ value: remaining }("");
+            if (burned) remaining = 0;
         }
         inflationCarry = remaining;
 
