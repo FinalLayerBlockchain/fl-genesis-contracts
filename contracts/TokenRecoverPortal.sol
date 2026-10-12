@@ -78,7 +78,7 @@ contract TokenRecoverPortal is SystemV2, Initializable, ReentrancyGuardUpgradeab
         __ReentrancyGuard_init_unchained();
 
         // Different address will be set depending on the environment
-        __Protectable_init_unchained(0x08E68Ec70FA3b629784fDB28887e206ce8561E08);
+        __Protectable_init_unchained(0xe643DA662420be3f839D522e32BB688894308F2B);
     }
 
     /**
