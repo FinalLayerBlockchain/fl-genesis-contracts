@@ -1,0 +1,11 @@
+forge flatten contracts/BSCValidatorSet.sol -o contracts/flattened/BSCValidatorSet.sol
+forge flatten contracts/GovHub.sol -o contracts/flattened/GovHub.sol
+forge flatten contracts/SlashIndicator.sol -o contracts/flattened/SlashIndicator.sol
+forge flatten contracts/SystemReward.sol -o contracts/flattened/SystemReward.sol
+forge flatten contracts/TokenHub.sol -o contracts/flattened/TokenHub.sol
+forge flatten contracts/StakeHub.sol -o contracts/flattened/StakeHub.sol
+forge flatten contracts/StakeCredit.sol -o contracts/flattened/StakeCredit.sol
+forge flatten contracts/BSCGovernor.sol -o contracts/flattened/BSCGovernor.sol
+forge flatten contracts/GovToken.sol -o contracts/flattened/GovToken.sol
+forge flatten contracts/BSCTimelock.sol -o contracts/flattened/BSCTimelock.sol
+forge flatten contracts/TokenRecoverPortal.sol -o contracts/flattened/TokenRecoverPortal.sol
