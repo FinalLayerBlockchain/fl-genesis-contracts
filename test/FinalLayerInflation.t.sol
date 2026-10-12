@@ -730,4 +730,35 @@ contract FinalLayerInflationTest is Test {
         );
         _distribute(amount);
     }
+
+    // Regression: validators in maintenance still count in Parlia's set, so
+    // they count as members that cannot seal.
+    function testRotationCountsMaintaining() public {
+        for (uint256 i; i < 3; ++i) {
+            _createValidator();
+        }
+        _setElected(consensusAddrs);
+        vm.warp(block.timestamp + 2 days);
+        vm.mockCall(VALIDATOR_CONTRACT_ADDR, abi.encodeWithSignature("numOfMaintaining()"), abi.encode(uint256(1)));
+        vm.expectRevert(StakeHub.TooManyPendingRotations.selector);
+        this.rotateExternal(0, 5000);
+        vm.mockCall(VALIDATOR_CONTRACT_ADDR, abi.encodeWithSignature("numOfMaintaining()"), abi.encode(uint256(0)));
+        _rotate(0, 5000);
+    }
+
+    // Regression: a rate change in the breathe block during post-halt catch-up
+    // books the whole backlog; the part the (capped) mint did not cover stays.
+    function testBacklogNotLostOnSameBlockRateChange() public {
+        _createValidator();
+        _setElected(consensusAddrs);
+        _breathe();
+        vm.warp(block.timestamp + 60 days);
+        uint256 minted = stakeHub.pendingStakingInflation(block.timestamp); // parent view: 30 days
+        vm.prank(GOV_HUB_ADDR);
+        stakeHub.updateParam("stakingAprBps", abi.encode(uint256(1500)));
+        _distribute(minted);
+        uint256 stake = 100_001 ether;
+        uint256 thirtyDays = (stake * 1200 * 11_000 * 30 days) / (100_000_000 * 365 days);
+        assertApproxEqAbs(stakeHub.accruedInflation(), thirtyDays, 4, "backlog beyond the mint was lost");
+    }
 }

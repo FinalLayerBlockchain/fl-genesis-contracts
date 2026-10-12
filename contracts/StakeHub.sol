@@ -217,7 +217,9 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     // A current validator that missed its turn within this many blocks counts
     // as offline for the rotation liveness check (SlashIndicator records the
     // block of every missed turn).
-    uint256 public constant RECENT_MISS_BLOCKS = 200;
+    // 21 cabinets * the largest governance turn length (64): an offline
+    // validator misses at least one turn in every such window.
+    uint256 public constant RECENT_MISS_BLOCKS = 1344;
     address private constant PQ_VERIFY_PRECOMPILE = address(0x0f01);
     uint8 private constant PQ_SCHEME_MLDSA87 = 0x01;
     uint256 private constant PQ_PUBKEY_LENGTH = 2592;
@@ -519,11 +521,22 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     function _checkRotationLiveness(
         address operatorAddress
     ) internal view {
-        address[] memory current = IBSCValidatorSet(VALIDATOR_CONTRACT_ADDR).getValidators();
-        uint256 n = current.length;
+        IBSCValidatorSet vs = IBSCValidatorSet(VALIDATOR_CONTRACT_ADDR);
+        address[] memory current = vs.getValidators();
+        // Parlia's quorum is over the set it took at the last epoch block. That
+        // set also holds validators that are in maintenance now and validators
+        // removed by a felony since the last breathe block, and it has at most
+        // numOfCabinets members. Both kinds are counted as members that cannot seal.
+        uint256 maintaining = vs.numOfMaintaining();
+        uint256 felonies = _felonyMap[block.timestamp / BREATHE_BLOCK_INTERVAL];
+        uint256 cabinets = vs.numOfCabinets();
+        if (cabinets == 0) cabinets = 21;
+        uint256 members = current.length + maintaining + felonies;
+        if (members > cabinets) members = cabinets;
+
         bool isCurrent;
-        uint256 unavailable;
-        for (uint256 i; i < n; ++i) {
+        uint256 unavailable = maintaining + felonies;
+        for (uint256 i; i < current.length; ++i) {
             address op = consensusToOperator[current[i]];
             if (op != address(0) && op == operatorAddress) {
                 isCurrent = true;
@@ -541,7 +554,9 @@ contract StakeHub is SystemV2, Initializable, Protectable {
             (uint256 missedAt,) = ISlashIndicatorMisses(SLASH_CONTRACT_ADDR).getSlashIndicator(current[i]);
             if (missedAt != 0 && missedAt + RECENT_MISS_BLOCKS >= block.number) ++unavailable;
         }
-        if (isCurrent && n < unavailable + 1 + n / 2 + 1) revert TooManyPendingRotations();
+        if (!isCurrent) return;
+        // after the rotation members - unavailable - 1 can seal; Parlia needs members/2 + 1
+        if (members < unavailable + 1 + members / 2 + 1) revert TooManyPendingRotations();
     }
 
     /**
@@ -851,8 +866,10 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         uint256 accPart = accruedInflation < msg.value ? accruedInflation : msg.value;
         uint256 accValidatorPart =
             accruedInflation == 0 ? 0 : (accruedValidatorInflation * accPart) / accruedInflation;
-        accruedInflation = 0;
-        accruedValidatorInflation = 0;
+        // Whatever accrual the mint did not cover (a rate change in this very
+        // block during post-halt catch-up) stays booked for the next one.
+        accruedInflation -= accPart;
+        accruedValidatorInflation -= accValidatorPart;
         emit StakingInflationDistributed(msg.value, elapsed);
 
         uint256 n = _inflationOperators.length;

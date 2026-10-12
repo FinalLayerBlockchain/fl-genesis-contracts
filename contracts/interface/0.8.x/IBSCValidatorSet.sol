@@ -5,4 +5,6 @@ interface IBSCValidatorSet {
     function felony(address consensusAddress) external;
 
     function getValidators() external view returns (address[] memory);
+    function numOfMaintaining() external view returns (uint256);
+    function numOfCabinets() external view returns (uint256);
 }
