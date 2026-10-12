@@ -189,6 +189,55 @@ contract FinalLayerInflationTest is Test {
         stakeHub.editVoteAddress(_voteId(address(0x1)), "");
     }
 
+    // Same vector as crypto/pq TestValidatorProofHashVector (Go), so the
+    // message the node tooling signs and the one StakeHub checks cannot drift.
+    function testValidatorProofHashMatchesGo() public {
+        vm.chainId(20261012);
+        assertEq(
+            _popMessage(0x1111111111111111111111111111111111111111, 0x2222222222222222222222222222222222222222),
+            0x59469dac0654c3ab96107422aaf84bfb2e30481a1bd352706c265b6fc8835d0b
+        );
+    }
+
+    // An agent may submit the edit, but the proof must name the operator.
+    function testEditConsensusAddressByAgentBindsOperator() public {
+        _createValidator();
+        address operator = operators[0];
+        address agent = address(0xA6E7);
+        vm.prank(operator);
+        stakeHub.updateAgent(agent);
+        vm.warp(block.timestamp + 2 days);
+        bytes memory pk = _fakePubKey(4242);
+        address newConsensus = _consensusOf(pk);
+
+        _acceptPop(pk, newConsensus, agent);
+        vm.prank(agent);
+        vm.expectRevert(StakeHub.InvalidConsensusAddress.selector);
+        stakeHub.editConsensusAddress(newConsensus, _proof(pk));
+
+        _acceptPop(pk, newConsensus, operator);
+        vm.prank(agent);
+        stakeHub.editConsensusAddress(newConsensus, _proof(pk));
+        assertEq(stakeHub.getValidatorConsensusAddress(operator), newConsensus);
+    }
+
+    // Only scheme 0x01 (ML-DSA-87) proofs are accepted, even if the key hash matches.
+    function testProofRejectsOtherScheme() public {
+        bytes memory pk = _fakePubKey(31);
+        address consensus = address(uint160(uint256(keccak256(bytes.concat(bytes1(0x02), pk)))));
+        address operator = address(0x0FE);
+        bytes memory proof = bytes.concat(bytes1(0x02), pk, new bytes(PQ_SIG_LEN));
+        vm.mockCall(
+            PQ_VERIFY,
+            bytes.concat(bytes1(0x02), _popMessage(consensus, operator), pk, new bytes(PQ_SIG_LEN)),
+            abi.encode(uint256(1))
+        );
+        vm.deal(operator, 100_001 ether);
+        vm.prank(operator);
+        vm.expectRevert(StakeHub.InvalidConsensusAddress.selector);
+        stakeHub.createValidator{ value: 100_001 ether }(consensus, _voteId(consensus), proof, _commission(), _description(31));
+    }
+
     // The elected (working) validator set as BSCValidatorSet.getValidators() reports it.
     function _setElected(address[] memory elected) internal {
         vm.mockCall(VALIDATOR_CONTRACT_ADDR, abi.encodeWithSignature("getValidators()"), abi.encode(elected));
