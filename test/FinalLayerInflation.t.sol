@@ -12,6 +12,7 @@ contract FinalLayerInflationTest is Test {
     address payable constant STAKE_HUB_ADDR = payable(0x0000000000000000000000000000000000002002);
     address payable constant STAKE_CREDIT_ADDR = payable(0x0000000000000000000000000000000000002003);
     address constant GOV_TOKEN_ADDR = 0x0000000000000000000000000000000000002005;
+    address constant GOV_HUB_ADDR = 0x0000000000000000000000000000000000001007;
 
     // Gas the miner reserves for ALL system transactions of a breathe block
     // (params.SystemTxsGasHardLimit). updateValidatorSetV2 needs most of it.
@@ -179,6 +180,7 @@ contract FinalLayerInflationTest is Test {
         vm.prank(operator);
         stakeHub.editConsensusAddress(newConsensus, _proof(pk));
         assertEq(stakeHub.getValidatorConsensusAddress(operator), newConsensus);
+        assertEq(stakeHub.getValidatorVoteAddress(operator), _voteId(newConsensus), "vote id did not follow");
     }
 
     function testEditVoteAddressDisabled() public {
@@ -255,10 +257,15 @@ contract FinalLayerInflationTest is Test {
         return IStakeCredit(stakeHub.getValidatorCreditContract(operators[i])).totalPooledBNB();
     }
 
-    // Anyone can register validators (2,000 FL each, still earning the APR).
-    // The breathe block system transaction must not grow with that number,
-    // otherwise header.GasUsed exceeds the block gas limit and every breathe
-    // block is invalid: a permanent chain halt.
+    // Takes the inflation snapshot the next distribution pays by (a breathe
+    // block that pays whatever is pending and re-snapshots).
+    function _breathe() internal returns (uint256 gasUsed) {
+        return _distribute(stakeHub.pendingStakingInflation(block.timestamp));
+    }
+
+    // Anyone can register validators (100,000 FL each). The breathe block system
+    // transaction must not grow with that number, otherwise header.GasUsed
+    // exceeds the block gas limit and every breathe block is invalid.
     function testInflationGasBoundedBySybilValidators() public {
         for (uint256 i; i < 200; ++i) {
             _createValidator();
@@ -268,7 +275,7 @@ contract FinalLayerInflationTest is Test {
             elected[i] = consensusAddrs[i];
         }
         _setElected(elected);
-
+        _breathe();
         vm.warp(block.timestamp + 1 days);
         uint256 amount = stakeHub.pendingStakingInflation(block.timestamp);
         assertGt(amount, 0);
@@ -278,7 +285,7 @@ contract FinalLayerInflationTest is Test {
     }
 
     // Only working validators earn; the minted amount equals what is paid out
-    // (up to rounding dust) and the expected 12% * 1.1 per year.
+    // (up to rounding dust, which is carried) and the expected 12% * 1.1 per year.
     function testInflationPaysElectedValidatorsOnly() public {
         for (uint256 i; i < 5; ++i) {
             _createValidator();
@@ -288,13 +295,12 @@ contract FinalLayerInflationTest is Test {
         elected[1] = consensusAddrs[2];
         elected[2] = consensusAddrs[2]; // duplicates are ignored
         _setElected(elected);
-
+        _breathe();
         uint256 t0 = block.timestamp;
         vm.warp(t0 + 365 days / 73); // 5 days
         uint256 amount = stakeHub.pendingStakingInflation(block.timestamp);
         uint256 base = 2 * 100_001 ether;
         assertEq(amount, (base * 1200 * 11_000 * (365 days / 73)) / (100_000_000 * 365 days));
-
         uint256[] memory before = new uint256[](5);
         for (uint256 i; i < 5; ++i) {
             before[i] = _pooled(i);
@@ -311,8 +317,145 @@ contract FinalLayerInflationTest is Test {
             paid += gained;
         }
         assertLe(amount - paid, 10, "minted inflation not paid out");
+        assertEq(amount - paid, stakeHub.inflationCarry(), "dust is carried, not lost");
         assertEq(stakeHub.lastInflationTime(), block.timestamp);
         assertEq(stakeHub.pendingStakingInflation(block.timestamp), 0);
+    }
+
+    // FL-04: stake added right before a breathe block does not earn the reward
+    // of the day before it; weights come from the previous breathe block.
+    function testLateStakeDoesNotCaptureReward() public {
+        for (uint256 i; i < 2; ++i) {
+            _createValidator();
+        }
+        _setElected(consensusAddrs);
+        _breathe();
+        vm.warp(block.timestamp + 1 days);
+        uint256 pendingBefore = stakeHub.pendingStakingInflation(block.timestamp);
+
+        // a whale delegates 10M FL into pool 1 just before the breathe block
+        address whale = address(0x77AA1E);
+        vm.deal(whale, 10_000_000 ether);
+        vm.prank(whale);
+        stakeHub.delegate{ value: 10_000_000 ether }(operators[1], false);
+
+        assertEq(stakeHub.pendingStakingInflation(block.timestamp), pendingBefore, "late stake changed the mint");
+        uint256 before0 = _pooled(0);
+        uint256 before1 = _pooled(1);
+        _distribute(pendingBefore);
+        uint256 gained0 = _pooled(0) - before0;
+        uint256 gained1 = _pooled(1) - before1;
+        // both pools had equal stake at the snapshot, so they split the day equally
+        assertApproxEqAbs(gained0, gained1, 2);
+        // the next day the whale's stake counts
+        (, uint256[] memory weights,) = stakeHub.getInflationSnapshot();
+        assertGt(weights[1], 10_000_000 ether);
+    }
+
+    // FL-02: a pool that rejects its payout keeps the amount as a claim that is
+    // retried, instead of losing it.
+    function testPayoutFailureIsRetried() public {
+        for (uint256 i; i < 2; ++i) {
+            _createValidator();
+        }
+        _setElected(consensusAddrs);
+        _breathe();
+        vm.warp(block.timestamp + 1 days);
+        uint256 amount = stakeHub.pendingStakingInflation(block.timestamp);
+        address credit0 = stakeHub.getValidatorCreditContract(operators[0]);
+        vm.mockCallRevert(credit0, abi.encodeWithSelector(IStakeCredit.distributeReward.selector), "down");
+        _distribute(amount);
+        uint256 owed = stakeHub.pendingStakerInflation(operators[0]) + stakeHub.pendingValidatorInflation(operators[0]);
+        assertApproxEqAbs(owed, amount / 2, 2, "failed share not booked");
+        vm.clearMockedCalls();
+        _setElected(consensusAddrs);
+        uint256 before = _pooled(0);
+        stakeHub.retryStakingInflation(operators[0]);
+        assertEq(stakeHub.pendingStakerInflation(operators[0]) + stakeHub.pendingValidatorInflation(operators[0]), 0);
+        assertEq(_pooled(0) - before, owed);
+    }
+
+    // FL-03: a pool whose stake cannot be read gets weight 0; the system
+    // transaction still succeeds.
+    function testRevertingStakeGetterDoesNotRevert() public {
+        for (uint256 i; i < 2; ++i) {
+            _createValidator();
+        }
+        _setElected(consensusAddrs);
+        address credit0 = stakeHub.getValidatorCreditContract(operators[0]);
+        vm.mockCallRevert(credit0, abi.encodeWithSelector(IStakeCredit.totalPooledBNB.selector), "broken");
+        _breathe();
+        (address[] memory ops,,) = stakeHub.getInflationSnapshot();
+        assertEq(ops.length, 1);
+        assertEq(ops[0], operators[1]);
+    }
+
+    // FL-11: after a halt longer than 30 days the missed time is paid on the
+    // following breathe blocks instead of being forfeited.
+    function testLongHaltIsCaughtUp() public {
+        _createValidator();
+        _setElected(consensusAddrs);
+        _breathe();
+        uint256 start = stakeHub.lastInflationTime();
+        vm.warp(start + 60 days);
+        uint256 stake = 100_001 ether;
+        uint256 perDay = (stake * 1200 * 11_000 * 1 days) / (100_000_000 * 365 days);
+        uint256 first = stakeHub.pendingStakingInflation(block.timestamp);
+        _distribute(first);
+        assertEq(stakeHub.lastInflationTime(), start + 30 days);
+        uint256 second = stakeHub.pendingStakingInflation(block.timestamp);
+        _distribute(second);
+        assertEq(stakeHub.lastInflationTime(), start + 60 days);
+        // the second catch-up pays on the grown (compounded) snapshot, so allow ~1.5%
+        assertApproxEqRel(first + second, perDay * 60, 2e16);
+        assertGe(first + second, perDay * 60);
+    }
+
+    // FL-12: a rate change only applies from the moment it is made.
+    function testRateChangeIsNotRetroactive() public {
+        _createValidator();
+        _setElected(consensusAddrs);
+        _breathe();
+        uint256 start = stakeHub.lastInflationTime();
+        vm.warp(start + 12 hours);
+        vm.prank(GOV_HUB_ADDR);
+        stakeHub.updateParam("stakingAprBps", abi.encode(uint256(2000)));
+        vm.warp(start + 24 hours);
+        uint256 half = 12 hours;
+        uint256 stake = 100_001 ether;
+        uint256 expected = (stake * 1200 * 11_000 * half) / (100_000_000 * 365 days)
+            + (stake * 2000 * 11_000 * half) / (100_000_000 * 365 days);
+        assertApproxEqAbs(stakeHub.pendingStakingInflation(block.timestamp), expected, 2);
+    }
+
+    // R2-07: governance cannot leave elected validators without inflation or
+    // lower the self delegation below the launch value.
+    function testGovernanceBounds() public {
+        vm.startPrank(GOV_HUB_ADDR);
+        vm.expectRevert();
+        stakeHub.updateParam("maxElectedValidators", abi.encode(uint256(101)));
+        stakeHub.updateParam("maxElectedValidators", abi.encode(uint256(100)));
+        vm.expectRevert();
+        stakeHub.updateParam("minSelfDelegationBNB", abi.encode(uint256(99_999 ether)));
+        stakeHub.updateParam("minSelfDelegationBNB", abi.encode(uint256(200_000 ether)));
+        vm.stopPrank();
+    }
+
+    // R2-06: the registered validator set (scanned by the daily election) is bounded.
+    function testRegisteredValidatorsCapped() public {
+        _createValidator();
+        // _validatorSet (EnumerableSet, slot 63): pretend it is full
+        vm.store(STAKE_HUB_ADDR, bytes32(uint256(63)), bytes32(stakeHub.MAX_REGISTERED_VALIDATORS()));
+        address operator = address(0xFFFF01);
+        bytes memory pk = _fakePubKey(999_999);
+        address consensus = _consensusOf(pk);
+        _acceptPop(pk, consensus, operator);
+        vm.deal(operator, 100_001 ether);
+        vm.prank(operator);
+        vm.expectRevert(StakeHub.TooManyValidators.selector);
+        stakeHub.createValidator{ value: 100_001 ether }(
+            consensus, _voteId(consensus), _proof(pk), _commission(), _description(999_999)
+        );
     }
 
     // The engine reads the validator list for the election at every breathe
@@ -342,13 +485,13 @@ contract FinalLayerInflationTest is Test {
         assertLt(pageGas, 50_000_000 / 4, "a page of 100 validators is too expensive");
     }
 
-    // Even a huge elected set (maxElectedValidators can be raised to 500) is cut
-    // at MAX_INFLATION_VALIDATORS recipients.
+    // Even a huge elected set is cut at MAX_INFLATION_VALIDATORS recipients.
     function testInflationRecipientsCapped() public {
         for (uint256 i; i < 120; ++i) {
             _createValidator();
         }
         _setElected(consensusAddrs);
+        _breathe();
         vm.warp(block.timestamp + 1 days);
         uint256 amount = stakeHub.pendingStakingInflation(block.timestamp);
         uint256 capped = (stakeHub.MAX_INFLATION_VALIDATORS() * 100_001 ether * 1200 * 11_000 * 1 days)

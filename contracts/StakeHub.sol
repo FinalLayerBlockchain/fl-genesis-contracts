@@ -35,6 +35,7 @@ contract StakeHub is SystemV2, Initializable, Protectable {
 
     /*----------------- errors -----------------*/
     // @notice signature: 0x5f28f62b
+    error TooManyValidators();
     error ValidatorExisted();
     // @notice signature: 0x056e8811
     error ValidatorNotExisted();
@@ -158,14 +159,36 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     // reward of its pool. 1000 = the validator earns an extra 10% on top of what
     // its delegators earn (1.2% of the pool per year at a 12% APR).
     uint256 public validatorRewardBps;
-    // Timestamp of the last inflation distribution.
+    // Inflation is paid up to this timestamp. After a halt longer than
+    // MAX_INFLATION_PERIOD it advances only by the time actually paid, so the
+    // missed time is caught up on the following breathe blocks.
     uint256 public lastInflationTime;
+    // Inflation accrued at the previous rates when a rate is changed by
+    // governance, paid at the next breathe block (rates never apply backwards).
+    uint256 public accruedInflation;
+    // Inflation that was minted but could not be assigned to a pool (rounding,
+    // pool jailed since the snapshot). It is paid out with the next distribution.
+    uint256 public inflationCarry;
+    // Staker and validator parts a pool failed to accept. Retried at every
+    // breathe block and by anyone through retryStakingInflation.
+    mapping(address => uint256) public pendingStakerInflation;
+    mapping(address => uint256) public pendingValidatorInflation;
+    // Recipients and stake weights taken at the previous breathe block. The
+    // next distribution pays by these weights, so stake added just before a
+    // breathe block does not earn the reward of the day before it.
+    address[] internal _inflationOperators;
+    address[] internal _inflationCredits;
+    uint256[] internal _inflationWeights;
+    uint256 public inflationWeightTotal;
 
     /*----------------- Final Layer constants -----------------*/
     uint256 public constant MAX_STAKING_APR_BPS = 2000; // 20% hard cap
     uint256 public constant MAX_VALIDATOR_REWARD_BPS = 5000; // 50% of the pool reward
     uint256 public constant MAX_INFLATION_PERIOD = 30 days; // cap after a long halt
     uint256 public constant MAX_INFLATION_VALIDATORS = 100; // bounds the breathe block system tx gas
+    // Bounds the daily election read, which scans every registered validator.
+    uint256 public constant MAX_REGISTERED_VALIDATORS = 500;
+    uint256 public constant MIN_SELF_DELEGATION_FLOOR = 100_000 ether;
     address private constant PQ_VERIFY_PRECOMPILE = address(0x0f01);
     uint8 private constant PQ_SCHEME_MLDSA87 = 0x01;
     uint256 private constant PQ_PUBKEY_LENGTH = 2592;
@@ -256,6 +279,7 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     event AgentChanged(address indexed operatorAddress, address indexed oldAgent, address indexed newAgent);
     event StakingInflationDistributed(uint256 amount, uint256 elapsed);
     event StakingInflationFailed(address indexed operatorAddress, uint256 amount);
+    event StakingInflationRetried(address indexed operatorAddress, uint256 amount);
 
     // Events for adding and removing NodeIDs.
     event NodeIDAdded(address indexed validator, bytes32 nodeID);
@@ -369,6 +393,7 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         address operatorAddress = msg.sender;
         if (_validatorSet.contains(operatorAddress)) revert ValidatorExisted();
         if (agentToOperator[operatorAddress] != address(0)) revert InvalidValidator();
+        if (_validatorSet.length() >= MAX_REGISTERED_VALIDATORS) revert TooManyValidators();
 
         if (consensusToOperator[consensusAddress] != address(0)) {
             revert DuplicateConsensusAddress();
@@ -441,6 +466,13 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         valInfo.consensusAddress = newConsensusAddress;
         valInfo.updateTime = block.timestamp;
         consensusToOperator[newConsensusAddress] = operatorAddress;
+
+        // The vote identifier is derived from the consensus address; keep them in step.
+        bytes memory newVoteAddress = bytes.concat(bytes4("FLPQ"), bytes24(0), bytes20(newConsensusAddress));
+        voteExpiration[valInfo.voteAddress] = block.timestamp;
+        valInfo.voteAddress = newVoteAddress;
+        voteToOperator[newVoteAddress] = operatorAddress;
+        emit VoteAddressEdited(operatorAddress, newVoteAddress);
 
         emit ConsensusAddressEdited(operatorAddress, newConsensusAddress);
     }
@@ -688,80 +720,171 @@ contract StakeHub is SystemV2, Initializable, Protectable {
 
     /**
      * @notice Amount of new FL the consensus engine mints at the breathe block
-     * whose timestamp is `timestamp`, given the current state.
-     * total = stake * apr * (1 + validatorReward) * elapsed / 1 year,
-     * summed over the working (elected, not jailed) validators of the current
-     * validator set, at most MAX_INFLATION_VALIDATORS of them.
+     * whose timestamp is `timestamp`, given the current state:
+     * accruedInflation + snapshotStake * apr * (1 + validatorReward) * elapsed / 1 year.
+     * snapshotStake is the stake of the working (elected, not jailed) validators
+     * taken at the previous breathe block, so it depends only on state written
+     * by the previous distribution and by governance, never on transactions of
+     * the breathe block itself. elapsed is capped at MAX_INFLATION_PERIOD.
      */
     function pendingStakingInflation(
         uint256 timestamp
     ) public view returns (uint256 total) {
-        if (lastInflationTime == 0 || timestamp <= lastInflationTime || stakingAprBps == 0) return 0;
-        uint256 elapsed = timestamp - lastInflationTime;
+        total = accruedInflation;
+        if (lastInflationTime == 0 || timestamp <= lastInflationTime) return total;
+        total += _inflationFor(timestamp - lastInflationTime);
+    }
+
+    function _inflationFor(
+        uint256 elapsed
+    ) internal view returns (uint256) {
         if (elapsed > MAX_INFLATION_PERIOD) elapsed = MAX_INFLATION_PERIOD;
-        (address[] memory credits,, uint256 n) = _inflationRecipients();
-        uint256 base;
-        for (uint256 i; i < n; ++i) {
-            base += IStakeCredit(credits[i]).totalPooledBNB();
-        }
-        total = (base * stakingAprBps * (10_000 + validatorRewardBps) * elapsed) / (100_000_000 * INFLATION_YEAR);
+        return (inflationWeightTotal * stakingAprBps * (10_000 + validatorRewardBps) * elapsed)
+            / (100_000_000 * INFLATION_YEAR);
+    }
+
+    /**
+     * @dev Books the inflation earned so far at the current rates before a rate
+     * changes, so a new rate only applies from now on.
+     */
+    function _checkpointInflation() internal {
+        if (lastInflationTime == 0 || block.timestamp <= lastInflationTime) return;
+        uint256 elapsed = block.timestamp - lastInflationTime;
+        if (elapsed > MAX_INFLATION_PERIOD) elapsed = MAX_INFLATION_PERIOD;
+        accruedInflation += _inflationFor(elapsed);
+        lastInflationTime += elapsed;
     }
 
     /**
      * @dev Called by the consensus engine once per breathe block (daily) with the
-     * newly minted inflation as msg.value. It never reverts: if a pool cannot
-     * accept its share, the share stays in this contract.
-     * Each working validator pool receives a share proportional to its stake. The
-     * delegators' part is added to the pool (raising the share price, so every
-     * delegator earns the APR); the validator part is minted to the validator as
-     * commission shares.
+     * newly minted inflation as msg.value. It never reverts: every external call
+     * is guarded, and FL that cannot be paid now is kept and paid later.
+     * Each pool of the previous snapshot receives a share proportional to its
+     * snapshot stake. The delegators' part is added to the pool (raising the
+     * share price, so every delegator earns the APR); the validator part is
+     * minted to the validator as commission shares. Then a new snapshot is taken.
      * This system transaction counts towards the block gas limit, so its work is
-     * bounded by the elected validator set (and MAX_INFLATION_VALIDATORS), never
-     * by the number of registered validators.
+     * bounded by MAX_INFLATION_VALIDATORS, never by the number of registered
+     * validators.
      */
     function distributeStakingInflation() external payable onlyCoinbase onlyZeroGasPrice {
-        uint256 elapsed = lastInflationTime == 0 ? 0 : block.timestamp - lastInflationTime;
-        lastInflationTime = block.timestamp;
-        uint256 amount = msg.value;
-        emit StakingInflationDistributed(amount, elapsed);
-        if (amount == 0) return;
-
-        (address[] memory credits, address[] memory operators, uint256 n) = _inflationRecipients();
-        uint256[] memory weights = new uint256[](n);
-        uint256 totalWeight;
-        for (uint256 i; i < n; ++i) {
-            weights[i] = IStakeCredit(credits[i]).totalPooledBNB();
-            totalWeight += weights[i];
+        uint256 elapsed;
+        if (lastInflationTime != 0 && block.timestamp > lastInflationTime) {
+            elapsed = block.timestamp - lastInflationTime;
+            if (elapsed > MAX_INFLATION_PERIOD) elapsed = MAX_INFLATION_PERIOD;
         }
-        if (totalWeight == 0) return;
+        if (lastInflationTime == 0) lastInflationTime = block.timestamp;
+        else lastInflationTime += elapsed;
+        accruedInflation = 0;
+        emit StakingInflationDistributed(msg.value, elapsed);
 
+        uint256 n = _inflationOperators.length;
+        // retry earlier failed payouts of the snapshot pools first
+        for (uint256 i; i < n; ++i) {
+            _retryPending(_inflationOperators[i]);
+        }
+
+        uint256 amount = msg.value + inflationCarry;
+        uint256 total = inflationWeightTotal;
         uint256 remaining = amount;
-        uint256 denominator = 10_000 + validatorRewardBps;
-        for (uint256 i; i < n; ++i) {
-            if (weights[i] == 0) continue;
-            uint256 share = (amount * weights[i]) / totalWeight;
-            if (share > remaining) share = remaining;
-            remaining -= share;
-            if (share == 0) continue;
-
-            address operatorAddress = operators[i];
-            address credit = credits[i];
-            uint256 validatorPart = (share * validatorRewardBps) / denominator;
-            uint256 stakerPart = share - validatorPart;
-            if (stakerPart > 0) {
-                try IStakeCredit(credit).distributeReward{ value: stakerPart }(0) { }
-                catch {
-                    emit StakingInflationFailed(operatorAddress, stakerPart);
-                }
+        if (amount > 0 && total > 0) {
+            uint256 denominator = 10_000 + validatorRewardBps;
+            for (uint256 i; i < n; ++i) {
+                uint256 share = (amount * _inflationWeights[i]) / total;
+                if (share == 0 || share > remaining) continue;
+                address operatorAddress = _inflationOperators[i];
+                // a pool jailed since the snapshot does not earn; its share is carried
+                if (_validators[operatorAddress].jailed) continue;
+                remaining -= share;
+                uint256 validatorPart = (share * validatorRewardBps) / denominator;
+                _payInflation(operatorAddress, _inflationCredits[i], share - validatorPart, validatorPart);
             }
-            if (validatorPart > 0) {
-                try IStakeCredit(credit).distributeReward{ value: validatorPart }(10_000) { }
-                catch {
-                    emit StakingInflationFailed(operatorAddress, validatorPart);
-                }
-            }
-            try IGovToken(GOV_TOKEN_ADDR).sync(credit, operatorAddress) { } catch { }
         }
+        inflationCarry = remaining;
+
+        _snapshotInflationRecipients();
+    }
+
+    /**
+     * @notice Pays out staking inflation a pool failed to accept earlier.
+     * Anyone can call it.
+     */
+    function retryStakingInflation(
+        address operatorAddress
+    ) external {
+        _retryPending(operatorAddress);
+    }
+
+    function _retryPending(
+        address operatorAddress
+    ) internal {
+        uint256 stakerPart = pendingStakerInflation[operatorAddress];
+        uint256 validatorPart = pendingValidatorInflation[operatorAddress];
+        if (stakerPart == 0 && validatorPart == 0) return;
+        Validator storage valInfo = _validators[operatorAddress];
+        if (valInfo.jailed || valInfo.creditContract == address(0)) return;
+        pendingStakerInflation[operatorAddress] = 0;
+        pendingValidatorInflation[operatorAddress] = 0;
+        emit StakingInflationRetried(operatorAddress, stakerPart + validatorPart);
+        _payInflation(operatorAddress, valInfo.creditContract, stakerPart, validatorPart);
+    }
+
+    function _payInflation(
+        address operatorAddress,
+        address credit,
+        uint256 stakerPart,
+        uint256 validatorPart
+    ) internal {
+        if (stakerPart > 0) {
+            try IStakeCredit(credit).distributeReward{ value: stakerPart }(0) { }
+            catch {
+                pendingStakerInflation[operatorAddress] += stakerPart;
+                emit StakingInflationFailed(operatorAddress, stakerPart);
+            }
+        }
+        if (validatorPart > 0) {
+            try IStakeCredit(credit).distributeReward{ value: validatorPart }(10_000) { }
+            catch {
+                pendingValidatorInflation[operatorAddress] += validatorPart;
+                emit StakingInflationFailed(operatorAddress, validatorPart);
+            }
+        }
+        try IGovToken(GOV_TOKEN_ADDR).sync(credit, operatorAddress) { } catch { }
+    }
+
+    /**
+     * @dev Records the current working validators and their stake as the weights
+     * of the next distribution. A pool whose stake cannot be read gets weight 0.
+     */
+    function _snapshotInflationRecipients() internal {
+        delete _inflationOperators;
+        delete _inflationCredits;
+        delete _inflationWeights;
+        uint256 total;
+        (address[] memory credits, address[] memory operators, uint256 n) = _inflationRecipients();
+        for (uint256 i; i < n; ++i) {
+            uint256 weight;
+            try IStakeCredit(credits[i]).totalPooledBNB() returns (uint256 pooled) {
+                weight = pooled;
+            } catch { }
+            if (weight == 0) continue;
+            _inflationOperators.push(operators[i]);
+            _inflationCredits.push(credits[i]);
+            _inflationWeights.push(weight);
+            total += weight;
+        }
+        inflationWeightTotal = total;
+    }
+
+    /**
+     * @notice The recipients and stake weights the next distribution pays by.
+     */
+    function getInflationSnapshot()
+        external
+        view
+        returns (address[] memory operators, uint256[] memory weights, uint256 total)
+    {
+        return (_inflationOperators, _inflationWeights, inflationWeightTotal);
     }
 
     /**
@@ -905,7 +1028,7 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         } else if (key.compareStrings("minSelfDelegationBNB")) {
             if (value.length != 32) revert InvalidValue(key, value);
             uint256 newMinSelfDelegationBNB = value.bytesToUint256(32);
-            if (newMinSelfDelegationBNB < 1000 ether || newMinSelfDelegationBNB > 100_000 ether) {
+            if (newMinSelfDelegationBNB < MIN_SELF_DELEGATION_FLOOR || newMinSelfDelegationBNB > 10_000_000 ether) {
                 revert InvalidValue(key, value);
             }
             minSelfDelegationBNB = newMinSelfDelegationBNB;
@@ -919,7 +1042,10 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         } else if (key.compareStrings("maxElectedValidators")) {
             if (value.length != 32) revert InvalidValue(key, value);
             uint256 newMaxElectedValidators = value.bytesToUint256(32);
-            if (newMaxElectedValidators == 0 || newMaxElectedValidators > 500) revert InvalidValue(key, value);
+            // every elected validator must be able to earn staking inflation
+            if (newMaxElectedValidators == 0 || newMaxElectedValidators > MAX_INFLATION_VALIDATORS) {
+                revert InvalidValue(key, value);
+            }
             maxElectedValidators = newMaxElectedValidators;
         } else if (key.compareStrings("unbondPeriod")) {
             if (value.length != 32) revert InvalidValue(key, value);
@@ -971,11 +1097,13 @@ contract StakeHub is SystemV2, Initializable, Protectable {
             if (value.length != 32) revert InvalidValue(key, value);
             uint256 newStakingAprBps = value.bytesToUint256(32);
             if (newStakingAprBps > MAX_STAKING_APR_BPS) revert InvalidValue(key, value);
+            _checkpointInflation();
             stakingAprBps = newStakingAprBps;
         } else if (key.compareStrings("validatorRewardBps")) {
             if (value.length != 32) revert InvalidValue(key, value);
             uint256 newValidatorRewardBps = value.bytesToUint256(32);
             if (newValidatorRewardBps > MAX_VALIDATOR_REWARD_BPS) revert InvalidValue(key, value);
+            _checkpointInflation();
             validatorRewardBps = newValidatorRewardBps;
         } else if (key.compareStrings("maxNodeIDs")) {
             if (value.length != 32) revert InvalidValue(key, value);
