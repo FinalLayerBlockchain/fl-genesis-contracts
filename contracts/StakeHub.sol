@@ -12,6 +12,12 @@ import "./interface/0.8.x/IGovToken.sol";
 import "./interface/0.8.x/IStakeCredit.sol";
 import "./lib/0.8.x/Utils.sol";
 
+interface ISlashIndicatorMisses {
+    function getSlashIndicator(
+        address validator
+    ) external view returns (uint256 height, uint256 count);
+}
+
 contract StakeHub is SystemV2, Initializable, Protectable {
     using Utils for string;
     using Utils for bytes;
@@ -188,6 +194,9 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     mapping(address => uint256) public consensusRotatedAt;
     // Timestamp of the block that took the current inflation snapshot.
     uint256 public inflationSnapshotTime;
+    // The validator-bonus part of accruedInflation, so a later change of
+    // validatorRewardBps does not re-split rewards that were already earned.
+    uint256 public accruedValidatorInflation;
 
     /*----------------- Final Layer constants -----------------*/
     uint256 public constant MAX_STAKING_APR_BPS = 2000; // 20% hard cap
@@ -205,6 +214,10 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     // the new key: the next breathe block (<= 1 day) installs it in the
     // validator set and the following epoch block (1000 blocks) in Parlia.
     uint256 public constant ROTATION_SETTLE_TIME = 1 days + 4 hours;
+    // A current validator that missed its turn within this many blocks counts
+    // as offline for the rotation liveness check (SlashIndicator records the
+    // block of every missed turn).
+    uint256 public constant RECENT_MISS_BLOCKS = 200;
     address private constant PQ_VERIFY_PRECOMPILE = address(0x0f01);
     uint8 private constant PQ_SCHEME_MLDSA87 = 0x01;
     uint256 private constant PQ_PUBKEY_LENGTH = 2592;
@@ -509,18 +522,26 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         address[] memory current = IBSCValidatorSet(VALIDATOR_CONTRACT_ADDR).getValidators();
         uint256 n = current.length;
         bool isCurrent;
-        uint256 pending;
+        uint256 unavailable;
         for (uint256 i; i < n; ++i) {
             address op = consensusToOperator[current[i]];
-            if (op == address(0)) continue;
-            if (op == operatorAddress) {
+            if (op != address(0) && op == operatorAddress) {
                 isCurrent = true;
                 continue;
             }
-            uint256 rotatedAt = consensusRotatedAt[op];
-            if (rotatedAt != 0 && rotatedAt + ROTATION_SETTLE_TIME > block.timestamp) ++pending;
+            // a rotation that has not settled yet: that validator cannot seal
+            if (op != address(0)) {
+                uint256 rotatedAt = consensusRotatedAt[op];
+                if (rotatedAt != 0 && rotatedAt + ROTATION_SETTLE_TIME > block.timestamp) {
+                    ++unavailable;
+                    continue;
+                }
+            }
+            // a validator that missed a turn recently is probably offline
+            (uint256 missedAt,) = ISlashIndicatorMisses(SLASH_CONTRACT_ADDR).getSlashIndicator(current[i]);
+            if (missedAt != 0 && missedAt + RECENT_MISS_BLOCKS >= block.number) ++unavailable;
         }
-        if (isCurrent && n < pending + 1 + n / 2 + 1) revert TooManyPendingRotations();
+        if (isCurrent && n < unavailable + 1 + n / 2 + 1) revert TooManyPendingRotations();
     }
 
     /**
@@ -795,10 +816,14 @@ contract StakeHub is SystemV2, Initializable, Protectable {
      */
     function _checkpointInflation() internal {
         if (lastInflationTime == 0 || block.timestamp <= lastInflationTime) return;
+        // All unpaid time is booked at the rates in force while it passed,
+        // including a backlog longer than MAX_INFLATION_PERIOD after a halt.
         uint256 elapsed = block.timestamp - lastInflationTime;
-        if (elapsed > MAX_INFLATION_PERIOD) elapsed = MAX_INFLATION_PERIOD;
-        accruedInflation += _inflationFor(elapsed);
-        lastInflationTime += elapsed;
+        uint256 amount = (inflationWeightTotal * stakingAprBps * (10_000 + validatorRewardBps) * elapsed)
+            / (100_000_000 * INFLATION_YEAR);
+        accruedInflation += amount;
+        accruedValidatorInflation += (amount * validatorRewardBps) / (10_000 + validatorRewardBps);
+        lastInflationTime = block.timestamp;
     }
 
     /**
@@ -821,7 +846,13 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         }
         if (lastInflationTime == 0) lastInflationTime = block.timestamp;
         else lastInflationTime += elapsed;
+        // The part of msg.value that was booked at earlier rates keeps the
+        // staker/validator split it was earned with.
+        uint256 accPart = accruedInflation < msg.value ? accruedInflation : msg.value;
+        uint256 accValidatorPart =
+            accruedInflation == 0 ? 0 : (accruedValidatorInflation * accPart) / accruedInflation;
         accruedInflation = 0;
+        accruedValidatorInflation = 0;
         emit StakingInflationDistributed(msg.value, elapsed);
 
         uint256 n = _inflationOperators.length;
@@ -830,30 +861,49 @@ contract StakeHub is SystemV2, Initializable, Protectable {
             _retryPending(_inflationOperators[i]);
         }
 
-        uint256 amount = msg.value + inflationCarry;
-        uint256 total = inflationWeightTotal;
-        uint256 remaining = amount;
-        if (amount > 0 && total > 0) {
+        // Pools that do not earn this time (jailed, or consensus key rotated
+        // since the snapshot) are left out of the split, so their share goes to
+        // the other pools now and can never flow back to them later.
+        uint256 eligibleTotal;
+        for (uint256 i; i < n; ++i) {
+            if (_earnsInflation(_inflationOperators[i])) eligibleTotal += _inflationWeights[i];
+        }
+        uint256 freshPart = msg.value - accPart + inflationCarry;
+        uint256 remaining = accPart + freshPart;
+        if (remaining > 0 && eligibleTotal > 0) {
             uint256 denominator = 10_000 + validatorRewardBps;
             for (uint256 i; i < n; ++i) {
-                uint256 share = (amount * _inflationWeights[i]) / total;
-                if (share == 0 || share > remaining) continue;
                 address operatorAddress = _inflationOperators[i];
-                // a pool jailed since the snapshot does not earn; its share is carried
-                if (_validators[operatorAddress].jailed) continue;
-                // nor does one whose consensus key was rotated since (it could not
-                // seal until the new key was installed, and is exempt from downtime
-                // slashing for that time)
-                uint256 rotatedAt = consensusRotatedAt[operatorAddress];
-                if (rotatedAt != 0 && rotatedAt >= inflationSnapshotTime) continue;
+                if (!_earnsInflation(operatorAddress)) continue;
+                uint256 w = _inflationWeights[i];
+                uint256 shareAcc = (accPart * w) / eligibleTotal;
+                uint256 shareFresh = (freshPart * w) / eligibleTotal;
+                uint256 share = shareAcc + shareFresh;
+                if (share == 0 || share > remaining) continue;
                 remaining -= share;
-                uint256 validatorPart = (share * validatorRewardBps) / denominator;
+                uint256 validatorPart =
+                    (accValidatorPart * w) / eligibleTotal + (shareFresh * validatorRewardBps) / denominator;
+                if (validatorPart > share) validatorPart = share;
                 _payInflation(operatorAddress, _inflationCredits[i], share - validatorPart, validatorPart);
             }
         }
         inflationCarry = remaining;
 
         _snapshotInflationRecipients();
+    }
+
+    /**
+     * @dev Whether a pool of the inflation snapshot earns at this distribution:
+     * not jailed, and its consensus key not rotated since the snapshot (it could
+     * not seal until the new key was installed, and is exempt from downtime
+     * slashing for that time).
+     */
+    function _earnsInflation(
+        address operatorAddress
+    ) internal view returns (bool) {
+        if (_validators[operatorAddress].jailed) return false;
+        uint256 rotatedAt = consensusRotatedAt[operatorAddress];
+        return rotatedAt == 0 || rotatedAt < inflationSnapshotTime;
     }
 
     /**

@@ -37,6 +37,12 @@ contract FinalLayerInflationTest is Test {
         vm.txGasPrice(0);
         vm.prank(coinbase);
         stakeHub.initialize();
+        // no missed turns recorded unless a test says otherwise
+        vm.mockCall(
+            0x0000000000000000000000000000000000001001,
+            abi.encodeWithSignature("getSlashIndicator(address)"),
+            abi.encode(uint256(0), uint256(0))
+        );
     }
 
     function _moniker(uint256 i) internal pure returns (string memory) {
@@ -663,7 +669,65 @@ contract FinalLayerInflationTest is Test {
         uint256 before1 = _pooled(1);
         _distribute(amount);
         assertEq(_pooled(0), before0, "rotated (non-producing) pool still earned");
-        assertGt(_pooled(1), before1);
-        assertApproxEqAbs(stakeHub.inflationCarry(), amount / 3, 3);
+        // R3-04: the forfeited share goes to the other pools now, not into the
+        // carry (which would pay part of it back to the forfeiting pool later)
+        assertApproxEqAbs(_pooled(1) - before1, amount / 2, 3);
+        assertLe(stakeHub.inflationCarry(), 3);
+    }
+
+    // R3-02: a rotation while another current validator is missing its turns
+    // would leave too few signers; it is refused until that validator is back.
+    function testRotationRefusedWhileValidatorMissing() public {
+        for (uint256 i; i < 3; ++i) {
+            _createValidator();
+        }
+        _setElected(consensusAddrs);
+        vm.warp(block.timestamp + 2 days);
+        vm.roll(1000);
+        vm.mockCall(
+            SLASH_ADDR,
+            abi.encodeWithSignature("getSlashIndicator(address)", consensusAddrs[2]),
+            abi.encode(uint256(995), uint256(3))
+        );
+        vm.expectRevert(StakeHub.TooManyPendingRotations.selector);
+        this.rotateExternal(0, 5000);
+        // C has produced again for a while (no miss in the last RECENT_MISS_BLOCKS)
+        vm.roll(995 + stakeHub.RECENT_MISS_BLOCKS() + 1);
+        _rotate(0, 5000);
+    }
+
+    // R3-05: a rate change after a halt longer than 30 days books the whole
+    // halt at the old rate.
+    function testRateChangeAfterLongHaltKeepsOldRate() public {
+        _createValidator();
+        _setElected(consensusAddrs);
+        _breathe();
+        vm.warp(block.timestamp + 60 days);
+        vm.prank(GOV_HUB_ADDR);
+        stakeHub.updateParam("stakingAprBps", abi.encode(uint256(2000)));
+        uint256 stake = 100_001 ether;
+        uint256 expected = (stake * 1200 * 11_000 * 60 days) / (100_000_000 * 365 days);
+        assertApproxEqAbs(stakeHub.pendingStakingInflation(block.timestamp), expected, 2);
+    }
+
+    // R3-06: rewards accrued before a validator bonus change keep the split they
+    // were earned with.
+    function testBonusChangeKeepsAccruedSplit() public {
+        _createValidator();
+        _setElected(consensusAddrs);
+        _breathe();
+        vm.warp(block.timestamp + 1 days);
+        vm.prank(GOV_HUB_ADDR);
+        stakeHub.updateParam("validatorRewardBps", abi.encode(uint256(5000)));
+        uint256 amount = stakeHub.pendingStakingInflation(block.timestamp);
+        uint256 validatorPart = (amount * 1000) / 11_000;
+        address credit = stakeHub.getValidatorCreditContract(operators[0]);
+        vm.expectCall(
+            credit, validatorPart, abi.encodeWithSelector(IStakeCredit.distributeReward.selector, uint64(10_000))
+        );
+        vm.expectCall(
+            credit, amount - validatorPart, abi.encodeWithSelector(IStakeCredit.distributeReward.selector, uint64(0))
+        );
+        _distribute(amount);
     }
 }
