@@ -181,6 +181,11 @@ contract FinalLayerInflationTest is Test {
         stakeHub.editConsensusAddress(newConsensus, _proof(pk));
         assertEq(stakeHub.getValidatorConsensusAddress(operator), newConsensus);
         assertEq(stakeHub.getValidatorVoteAddress(operator), _voteId(newConsensus), "vote id did not follow");
+        // the node (consensus/parlia/consensus_revocation.go) reads
+        // consensusExpiration at storage slot 68 to reject the old key at once
+        address oldConsensus = consensusAddrs[0];
+        bytes32 raw = vm.load(STAKE_HUB_ADDR, keccak256(abi.encode(oldConsensus, uint256(68))));
+        assertEq(uint256(raw), block.timestamp, "consensusExpiration slot moved");
     }
 
     function testEditVoteAddressDisabled() public {
