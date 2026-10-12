@@ -3,4 +3,6 @@ pragma solidity 0.8.17;
 
 interface IBSCValidatorSet {
     function felony(address consensusAddress) external;
+
+    function getValidators() external view returns (address[] memory);
 }

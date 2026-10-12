@@ -277,8 +277,14 @@ contract SlashIndicator is ISlashIndicator, System, IParamSubscriber, IApplicati
 
         require(header1.length != 0 && header2.length != 0, "empty header");
 
+        // Final Layer: header seals commit to the real chain id (20261012), which
+        // does not fit the uint16 bscChainID constant.
+        uint256 sealChainId;
+        assembly {
+            sealChainId := chainid()
+        }
         bytes[] memory elements = new bytes[](3);
-        elements[0] = bscChainID.encodeUint();
+        elements[0] = sealChainId.encodeUint();
         elements[1] = header1.encodeBytes();
         elements[2] = header2.encodeBytes();
 

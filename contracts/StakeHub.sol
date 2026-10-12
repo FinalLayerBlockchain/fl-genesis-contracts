@@ -165,6 +165,7 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     uint256 public constant MAX_STAKING_APR_BPS = 2000; // 20% hard cap
     uint256 public constant MAX_VALIDATOR_REWARD_BPS = 5000; // 50% of the pool reward
     uint256 public constant MAX_INFLATION_PERIOD = 30 days; // cap after a long halt
+    uint256 public constant MAX_INFLATION_VALIDATORS = 100; // bounds the breathe block system tx gas
     uint256 private constant INFLATION_YEAR = 365 days;
 
     /*----------------- structs and events -----------------*/
@@ -690,7 +691,8 @@ contract StakeHub is SystemV2, Initializable, Protectable {
      * @notice Amount of new FL the consensus engine mints at the breathe block
      * whose timestamp is `timestamp`, given the current state.
      * total = stake * apr * (1 + validatorReward) * elapsed / 1 year,
-     * summed over every validator that is not jailed.
+     * summed over the working (elected, not jailed) validators of the current
+     * validator set, at most MAX_INFLATION_VALIDATORS of them.
      */
     function pendingStakingInflation(
         uint256 timestamp
@@ -698,7 +700,11 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         if (lastInflationTime == 0 || timestamp <= lastInflationTime || stakingAprBps == 0) return 0;
         uint256 elapsed = timestamp - lastInflationTime;
         if (elapsed > MAX_INFLATION_PERIOD) elapsed = MAX_INFLATION_PERIOD;
-        uint256 base = _inflationBase();
+        (address[] memory credits,, uint256 n) = _inflationRecipients();
+        uint256 base;
+        for (uint256 i; i < n; ++i) {
+            base += IStakeCredit(credits[i]).totalPooledBNB();
+        }
         total = (base * stakingAprBps * (10_000 + validatorRewardBps) * elapsed) / (100_000_000 * INFLATION_YEAR);
     }
 
@@ -706,10 +712,13 @@ contract StakeHub is SystemV2, Initializable, Protectable {
      * @dev Called by the consensus engine once per breathe block (daily) with the
      * newly minted inflation as msg.value. It never reverts: if a pool cannot
      * accept its share, the share stays in this contract.
-     * Each validator pool receives a share proportional to its stake. The
+     * Each working validator pool receives a share proportional to its stake. The
      * delegators' part is added to the pool (raising the share price, so every
      * delegator earns the APR); the validator part is minted to the validator as
      * commission shares.
+     * This system transaction counts towards the block gas limit, so its work is
+     * bounded by the elected validator set (and MAX_INFLATION_VALIDATORS), never
+     * by the number of registered validators.
      */
     function distributeStakingInflation() external payable onlyCoinbase onlyZeroGasPrice {
         uint256 elapsed = lastInflationTime == 0 ? 0 : block.timestamp - lastInflationTime;
@@ -718,28 +727,26 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         emit StakingInflationDistributed(amount, elapsed);
         if (amount == 0) return;
 
-        uint256 length = _validatorSet.length();
-        uint256[] memory weights = new uint256[](length);
+        (address[] memory credits, address[] memory operators, uint256 n) = _inflationRecipients();
+        uint256[] memory weights = new uint256[](n);
         uint256 totalWeight;
-        for (uint256 i; i < length; ++i) {
-            Validator memory valInfo = _validators[_validatorSet.at(i)];
-            if (valInfo.jailed || valInfo.creditContract == address(0)) continue;
-            weights[i] = IStakeCredit(valInfo.creditContract).totalPooledBNB();
+        for (uint256 i; i < n; ++i) {
+            weights[i] = IStakeCredit(credits[i]).totalPooledBNB();
             totalWeight += weights[i];
         }
         if (totalWeight == 0) return;
 
         uint256 remaining = amount;
         uint256 denominator = 10_000 + validatorRewardBps;
-        for (uint256 i; i < length; ++i) {
+        for (uint256 i; i < n; ++i) {
             if (weights[i] == 0) continue;
             uint256 share = (amount * weights[i]) / totalWeight;
             if (share > remaining) share = remaining;
             remaining -= share;
             if (share == 0) continue;
 
-            address operatorAddress = _validatorSet.at(i);
-            address credit = _validators[operatorAddress].creditContract;
+            address operatorAddress = operators[i];
+            address credit = credits[i];
             uint256 validatorPart = (share * validatorRewardBps) / denominator;
             uint256 stakerPart = share - validatorPart;
             if (stakerPart > 0) {
@@ -758,12 +765,39 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         }
     }
 
-    function _inflationBase() internal view returns (uint256 base) {
-        uint256 length = _validatorSet.length();
+    /**
+     * @dev Validators that earn staking inflation: the working validators of the
+     * current (elected) validator set that are registered here and not jailed.
+     * Registering a validator is permissionless, so iterating every registered
+     * validator would let anyone push the breathe block over the gas limit.
+     */
+    function _inflationRecipients()
+        internal
+        view
+        returns (address[] memory credits, address[] memory operators, uint256 n)
+    {
+        address[] memory consensusAddrs = IBSCValidatorSet(VALIDATOR_CONTRACT_ADDR).getValidators();
+        uint256 length = consensusAddrs.length;
+        if (length > MAX_INFLATION_VALIDATORS) length = MAX_INFLATION_VALIDATORS;
+        credits = new address[](length);
+        operators = new address[](length);
         for (uint256 i; i < length; ++i) {
-            Validator memory valInfo = _validators[_validatorSet.at(i)];
-            if (valInfo.jailed || valInfo.creditContract == address(0)) continue;
-            base += IStakeCredit(valInfo.creditContract).totalPooledBNB();
+            address operatorAddress = consensusToOperator[consensusAddrs[i]];
+            if (operatorAddress == address(0)) continue;
+            Validator storage valInfo = _validators[operatorAddress];
+            address credit = valInfo.creditContract;
+            if (valInfo.jailed || credit == address(0)) continue;
+            bool seen;
+            for (uint256 j; j < n; ++j) {
+                if (operators[j] == operatorAddress) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) continue;
+            credits[n] = credit;
+            operators[n] = operatorAddress;
+            ++n;
         }
     }
 
