@@ -214,15 +214,21 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     uint256 public constant MAX_REGISTERED_VALIDATORS = 500;
     uint256 public constant MIN_SELF_DELEGATION_FLOOR = 100_000 ether;
     // After a breathe block the contract's elected set and Parlia's set differ
-    // until the next epoch block (1000 blocks) plus len/2 blocks; rotations are
-    // frozen for that window so the liveness check sees Parlia's set.
-    uint256 public constant ROTATION_FREEZE_BLOCKS = 1100;
+    // until Parlia applies header E + minerHistoryCheckLen of the next epoch block
+    // E whose header carries the new set. A breathe block that is itself an epoch
+    // block is not in its own header (it is read from the parent state), so in the
+    // worst case E = breathe + 1000, and checkLen = (n/2 + 1) * turnLength - 1 with
+    // n <= MAX_INFLATION_VALIDATORS cabinets and turnLength <= 64 (the governance
+    // bounds of BSCValidatorSet). Rotations are frozen for that window so the
+    // liveness check sees Parlia's set.
+    uint256 public constant ROTATION_FREEZE_BLOCKS = 1000 + (MAX_INFLATION_VALIDATORS / 2 + 1) * 64;
     // A current validator that missed its turn within this many blocks counts
     // as offline for the rotation liveness check (SlashIndicator records the
     // block of every missed turn).
-    // 21 cabinets * the largest governance turn length (64): an offline
-    // validator misses at least one turn in every such window.
-    uint256 public constant RECENT_MISS_BLOCKS = 1344;
+    // 2 * the largest validator set (MAX_INFLATION_VALIDATORS) * the largest
+    // governance turn length (64): an offline validator misses at least one
+    // turn in every such window, also across a set switch that reorders turns.
+    uint256 public constant RECENT_MISS_BLOCKS = 2 * MAX_INFLATION_VALIDATORS * 64;
     address private constant PQ_VERIFY_PRECOMPILE = address(0x0f01);
     uint8 private constant PQ_SCHEME_MLDSA87 = 0x01;
     uint256 private constant PQ_PUBKEY_LENGTH = 2592;

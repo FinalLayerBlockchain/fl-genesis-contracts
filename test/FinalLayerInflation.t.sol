@@ -633,6 +633,32 @@ contract FinalLayerInflationTest is Test {
         _rotate(0, 5000);
     }
 
+    // R6: Parlia switches to the set of epoch block E only when it applies header
+    // E + minerHistoryCheckLen, with checkLen = (n/2 + 1) * turnLength - 1 of the
+    // outgoing set (snapshot.go apply). A breathe block that IS an epoch block is
+    // not in that epoch's header (prepareValidators reads the parent state), so
+    // its set is installed only after B + 1000 + checkLen. Governance allows
+    // turnLength up to 64 (BSCValidatorSet) and up to MAX_INFLATION_VALIDATORS (50)
+    // cabinets. A rotation in block R revokes the old key from R + 1, so every
+    // block up to the switch must still be frozen.
+    function testFreezeCoversWorstCaseParliaSwitch() public {
+        for (uint256 i; i < 3; ++i) {
+            _createValidator();
+        }
+        _setElected(consensusAddrs);
+        vm.warp(block.timestamp + 2 days);
+        uint256 breathe = 5000; // lands exactly on an epoch block
+        vm.roll(breathe);
+        _breathe();
+        uint256 checkLen = (stakeHub.MAX_INFLATION_VALIDATORS() / 2 + 1) * 64 - 1;
+        uint256 lastOldSetBlock = breathe + 1000 + checkLen; // still sealed by the old set
+        vm.roll(lastOldSetBlock - 1);
+        vm.expectRevert(StakeHub.RotationFrozen.selector);
+        this.rotateExternal(0, 5000);
+        vm.roll(breathe + stakeHub.ROTATION_FREEZE_BLOCKS() + 1);
+        _rotate(0, 5000);
+    }
+
     // R4-03: when no snapshot pool earns, the inflation is burned, not carried
     // (the carry could pay it back to the forfeiting pools later).
     function testNoEligiblePoolBurns() public {
