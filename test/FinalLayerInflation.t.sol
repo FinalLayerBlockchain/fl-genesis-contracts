@@ -44,19 +44,149 @@ contract FinalLayerInflationTest is Test {
         return string(b);
     }
 
+    address constant PQ_VERIFY = address(0x0f01);
+    uint256 constant PQ_PK_LEN = 2592;
+    uint256 constant PQ_SIG_LEN = 4627;
+
+    // A stand-in ML-DSA-87 public key: forge has no ML-DSA precompile, so the
+    // signature check at 0x0f01 is mocked and these tests cover the binding
+    // logic around it (derived address, message, vote identifier).
+    function _fakePubKey(uint256 i) internal pure returns (bytes memory pk) {
+        pk = new bytes(PQ_PK_LEN);
+        bytes32 seed = keccak256(abi.encode("pk", i));
+        for (uint256 j = 0; j < 32; j++) {
+            pk[j] = seed[j];
+        }
+    }
+
+    function _consensusOf(bytes memory pk) internal pure returns (address) {
+        return address(uint160(uint256(keccak256(bytes.concat(bytes1(0x01), pk)))));
+    }
+
+    function _proof(bytes memory pk) internal pure returns (bytes memory) {
+        return bytes.concat(bytes1(0x01), pk, new bytes(PQ_SIG_LEN));
+    }
+
+    function _voteId(address consensus) internal pure returns (bytes memory) {
+        return bytes.concat(bytes4("FLPQ"), bytes24(0), bytes20(consensus));
+    }
+
+    function _popMessage(address consensus, address operator) internal view returns (bytes32) {
+        return keccak256(abi.encodePacked("FinalLayer/validator-pop/v1", block.chainid, consensus, operator));
+    }
+
+    // Mocks the precompile to accept exactly this (pk, message) pair.
+    function _acceptPop(bytes memory pk, address consensus, address operator) internal {
+        bytes memory input = bytes.concat(bytes1(0x01), _popMessage(consensus, operator), pk, new bytes(PQ_SIG_LEN));
+        vm.mockCall(PQ_VERIFY, input, abi.encode(uint256(1)));
+    }
+
+    function _commission() internal pure returns (StakeHub.Commission memory) {
+        return StakeHub.Commission({ rate: 1000, maxRate: 5000, maxChangeRate: 500 });
+    }
+
+    function _description(uint256 i) internal pure returns (StakeHub.Description memory) {
+        return StakeHub.Description({ moniker: _moniker(i), identity: "", website: "", details: "" });
+    }
+
     function _createValidator() internal {
         address operator = address(uint160(uint256(keccak256(abi.encode("op", nextUser)))));
-        address consensus = address(uint160(uint256(keccak256(abi.encode("cons", nextUser)))));
-        bytes memory voteAddress = bytes.concat(bytes28(0), bytes20(consensus));
-        StakeHub.Commission memory commission = StakeHub.Commission({ rate: 1000, maxRate: 5000, maxChangeRate: 500 });
-        StakeHub.Description memory description =
-            StakeHub.Description({ moniker: _moniker(nextUser), identity: "", website: "", details: "" });
-        nextUser++;
-        vm.deal(operator, 2_001 ether);
+        bytes memory pk = _fakePubKey(nextUser);
+        address consensus = _consensusOf(pk);
+        _acceptPop(pk, consensus, operator);
+        uint256 value = 100_001 ether;
+        vm.deal(operator, value);
         vm.prank(operator);
-        stakeHub.createValidator{ value: 2_001 ether }(consensus, voteAddress, "", commission, description);
+        stakeHub.createValidator{ value: value }(
+            consensus, _voteId(consensus), _proof(pk), _commission(), _description(nextUser)
+        );
+        nextUser++;
         operators.push(operator);
         consensusAddrs.push(consensus);
+    }
+
+    function testLaunchParameters() public {
+        assertEq(stakeHub.minSelfDelegationBNB(), 100_000 ether);
+        assertEq(stakeHub.maxElectedValidators(), 21);
+    }
+
+    function testCreateValidatorRequiresProofOfPossession() public {
+        address operator = address(0xA11CE);
+        address attacker = address(0xBAD);
+        bytes memory pk = _fakePubKey(777);
+        address consensus = _consensusOf(pk);
+        vm.deal(attacker, 200_000 ether);
+
+        // No proof at all.
+        vm.prank(attacker);
+        vm.expectRevert(StakeHub.InvalidConsensusAddress.selector);
+        stakeHub.createValidator{ value: 100_001 ether }(consensus, _voteId(consensus), "", _commission(), _description(1));
+
+        // The victim's proof (made for its own operator) replayed by an attacker.
+        _acceptPop(pk, consensus, operator);
+        vm.prank(attacker);
+        vm.expectRevert(StakeHub.InvalidConsensusAddress.selector);
+        stakeHub.createValidator{ value: 100_001 ether }(
+            consensus, _voteId(consensus), _proof(pk), _commission(), _description(1)
+        );
+
+        // A valid signature by a key that does not derive the consensus address.
+        bytes memory otherPk = _fakePubKey(778);
+        _acceptPop(otherPk, consensus, attacker);
+        vm.prank(attacker);
+        vm.expectRevert(StakeHub.InvalidConsensusAddress.selector);
+        stakeHub.createValidator{ value: 100_001 ether }(
+            consensus, _voteId(consensus), _proof(otherPk), _commission(), _description(1)
+        );
+
+        // Vote identifier not derived from the consensus address.
+        _acceptPop(pk, consensus, attacker);
+        vm.prank(attacker);
+        vm.expectRevert(StakeHub.InvalidVoteAddress.selector);
+        stakeHub.createValidator{ value: 100_001 ether }(
+            consensus, _voteId(address(0x1234)), _proof(pk), _commission(), _description(1)
+        );
+
+        // Below the minimum self delegation.
+        vm.prank(attacker);
+        vm.expectRevert(StakeHub.SelfDelegationNotEnough.selector);
+        stakeHub.createValidator{ value: 99_999 ether }(
+            consensus, _voteId(consensus), _proof(pk), _commission(), _description(1)
+        );
+
+        // The real operator with a proof bound to it succeeds.
+        _acceptPop(pk, consensus, operator);
+        vm.deal(operator, 100_001 ether);
+        vm.prank(operator);
+        stakeHub.createValidator{ value: 100_001 ether }(
+            consensus, _voteId(consensus), _proof(pk), _commission(), _description(1)
+        );
+        assertEq(stakeHub.getValidatorConsensusAddress(operator), consensus);
+    }
+
+    function testEditConsensusAddressRequiresProof() public {
+        _createValidator();
+        address operator = operators[0];
+        vm.warp(block.timestamp + 2 days);
+        bytes memory pk = _fakePubKey(999);
+        address newConsensus = _consensusOf(pk);
+
+        vm.prank(operator);
+        vm.expectRevert(StakeHub.InvalidConsensusAddress.selector);
+        stakeHub.editConsensusAddress(newConsensus, "");
+
+        _acceptPop(pk, newConsensus, operator);
+        vm.prank(operator);
+        stakeHub.editConsensusAddress(newConsensus, _proof(pk));
+        assertEq(stakeHub.getValidatorConsensusAddress(operator), newConsensus);
+    }
+
+    function testEditVoteAddressDisabled() public {
+        _createValidator();
+        vm.warp(block.timestamp + 2 days);
+        vm.prank(operators[0]);
+        vm.expectRevert(StakeHub.InvalidVoteAddress.selector);
+        stakeHub.editVoteAddress(_voteId(address(0x1)), "");
     }
 
     // The elected (working) validator set as BSCValidatorSet.getValidators() reports it.
@@ -113,7 +243,7 @@ contract FinalLayerInflationTest is Test {
         uint256 t0 = block.timestamp;
         vm.warp(t0 + 365 days / 73); // 5 days
         uint256 amount = stakeHub.pendingStakingInflation(block.timestamp);
-        uint256 base = 2 * 2_001 ether;
+        uint256 base = 2 * 100_001 ether;
         assertEq(amount, (base * 1200 * 11_000 * (365 days / 73)) / (100_000_000 * 365 days));
 
         uint256[] memory before = new uint256[](5);
@@ -172,11 +302,11 @@ contract FinalLayerInflationTest is Test {
         _setElected(consensusAddrs);
         vm.warp(block.timestamp + 1 days);
         uint256 amount = stakeHub.pendingStakingInflation(block.timestamp);
-        uint256 capped = (stakeHub.MAX_INFLATION_VALIDATORS() * 2_001 ether * 1200 * 11_000 * 1 days)
+        uint256 capped = (stakeHub.MAX_INFLATION_VALIDATORS() * 100_001 ether * 1200 * 11_000 * 1 days)
             / (100_000_000 * 365 days);
         assertEq(amount, capped);
         uint256 gasUsed = _distribute(amount);
         emit log_named_uint("distributeStakingInflation gas, 120 elected (capped at 100)", gasUsed);
-        assertEq(_pooled(119), 2_001 ether);
+        assertEq(_pooled(119), 100_001 ether);
     }
 }

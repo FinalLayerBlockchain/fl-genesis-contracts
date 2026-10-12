@@ -166,6 +166,10 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     uint256 public constant MAX_VALIDATOR_REWARD_BPS = 5000; // 50% of the pool reward
     uint256 public constant MAX_INFLATION_PERIOD = 30 days; // cap after a long halt
     uint256 public constant MAX_INFLATION_VALIDATORS = 100; // bounds the breathe block system tx gas
+    address private constant PQ_VERIFY_PRECOMPILE = address(0x0f01);
+    uint8 private constant PQ_SCHEME_MLDSA87 = 0x01;
+    uint256 private constant PQ_PUBKEY_LENGTH = 2592;
+    uint256 private constant PQ_PROOF_LENGTH = 1 + 2592 + 4627;
     uint256 private constant INFLATION_YEAR = 365 days;
 
     /*----------------- structs and events -----------------*/
@@ -287,9 +291,9 @@ contract StakeHub is SystemV2, Initializable, Protectable {
      */
     function initialize() external initializer onlyCoinbase onlyZeroGasPrice {
         transferGasLimit = 5000;
-        minSelfDelegationBNB = 2_000 ether;
+        minSelfDelegationBNB = 100_000 ether;
         minDelegationBNBChange = 1 ether;
-        maxElectedValidators = 45;
+        maxElectedValidators = 21;
         unbondPeriod = 7 days;
         redelegateFeeRate = 2;
         downtimeSlashAmount = 10 ether;
@@ -384,8 +388,10 @@ contract StakeHub is SystemV2, Initializable, Protectable {
                 || commission.maxChangeRate > commission.maxRate
         ) revert InvalidCommission();
         if (!_checkMoniker(description.moniker)) revert InvalidMoniker();
-        // proof-of-possession verify
-        if (!_checkVoteAddress(operatorAddress, voteAddress, blsProof)) revert InvalidVoteAddress();
+        // the vote address is only an identifier derived from the consensus address
+        if (!_checkVoteAddress(consensusAddress, voteAddress)) revert InvalidVoteAddress();
+        // ML-DSA proof of possession of the consensus key (blsProof carries it)
+        if (!_checkConsensusProof(consensusAddress, operatorAddress, blsProof)) revert InvalidConsensusAddress();
 
         // deploy stake credit proxy contract
         address creditContract = _deployStakeCredit(operatorAddress, description.moniker);
@@ -413,9 +419,11 @@ contract StakeHub is SystemV2, Initializable, Protectable {
 
     /**
      * @param newConsensusAddress the new consensus address of the validator
+     * @param consensusProof ML-DSA proof of possession of the new consensus key
      */
     function editConsensusAddress(
-        address newConsensusAddress
+        address newConsensusAddress,
+        bytes calldata consensusProof
     ) external whenNotPaused notInBlackList validatorExist(_bep410MsgSender()) {
         if (newConsensusAddress == address(0)) revert InvalidConsensusAddress();
         if (consensusToOperator[newConsensusAddress] != address(0)) {
@@ -423,6 +431,9 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         }
 
         address operatorAddress = _bep410MsgSender();
+        if (!_checkConsensusProof(newConsensusAddress, operatorAddress, consensusProof)) {
+            revert InvalidConsensusAddress();
+        }
         Validator storage valInfo = _validators[operatorAddress];
         if (valInfo.updateTime + BREATHE_BLOCK_INTERVAL > block.timestamp) revert UpdateTooFrequently();
 
@@ -482,22 +493,10 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         bytes calldata newVoteAddress,
         bytes calldata blsProof
     ) external whenNotPaused notInBlackList validatorExist(_bep410MsgSender()) {
-        // proof-of-possession verify
-        address operatorAddress = _bep410MsgSender();
-        if (!_checkVoteAddress(operatorAddress, newVoteAddress, blsProof)) revert InvalidVoteAddress();
-        if (voteToOperator[newVoteAddress] != address(0)) {
-            revert DuplicateVoteAddress();
-        }
-
-        Validator storage valInfo = _validators[operatorAddress];
-        if (valInfo.updateTime + BREATHE_BLOCK_INTERVAL > block.timestamp) revert UpdateTooFrequently();
-
-        voteExpiration[valInfo.voteAddress] = block.timestamp;
-        valInfo.voteAddress = newVoteAddress;
-        valInfo.updateTime = block.timestamp;
-        voteToOperator[newVoteAddress] = operatorAddress;
-
-        emit VoteAddressEdited(operatorAddress, newVoteAddress);
+        // Final Layer has no BLS vote keys; the identifier is fixed at creation.
+        newVoteAddress;
+        blsProof;
+        revert InvalidVoteAddress();
     }
 
     /**
@@ -1337,15 +1336,35 @@ contract StakeHub is SystemV2, Initializable, Protectable {
 
     /**
      * @dev Final Layer has no BLS fast finality. The vote address is kept only as
-     * an opaque 48 byte validator identifier (it must be unique); no BLS
-     * proof-of-possession is verified and the proof argument must be empty.
+     * a 48 byte validator identifier: "FLPQ" || 24 zero bytes || consensus
+     * address. Binding it to the consensus address (which needs a proof of
+     * possession) stops anyone from front-running another validator's identifier.
      */
-    function _checkVoteAddress(
-        address,
-        bytes calldata voteAddress,
-        bytes calldata blsProof
-    ) internal pure returns (bool) {
-        return voteAddress.length == BLS_PUBKEY_LENGTH && blsProof.length == 0;
+    function _checkVoteAddress(address consensusAddress, bytes calldata voteAddress) internal pure returns (bool) {
+        return keccak256(voteAddress) == keccak256(bytes.concat(bytes4("FLPQ"), bytes24(0), bytes20(consensusAddress)));
+    }
+
+    /**
+     * @dev ML-DSA-87 proof of possession of a consensus key.
+     * proof = scheme(1) || publicKey(2592) || signature(4627). The key must derive
+     * consensusAddress (last 20 bytes of keccak256(scheme || publicKey)) and the
+     * signature must verify in the FinalLayer/contract/v1 domain (precompile
+     * 0x0f01) over keccak256("FinalLayer/validator-pop/v1" || chainid ||
+     * consensusAddress || operatorAddress).
+     */
+    function _checkConsensusProof(
+        address consensusAddress,
+        address operatorAddress,
+        bytes calldata proof
+    ) internal view returns (bool) {
+        if (proof.length != PQ_PROOF_LENGTH || uint8(proof[0]) != PQ_SCHEME_MLDSA87) return false;
+        if (address(uint160(uint256(keccak256(proof[:1 + PQ_PUBKEY_LENGTH])))) != consensusAddress) return false;
+        bytes32 message = keccak256(
+            abi.encodePacked("FinalLayer/validator-pop/v1", block.chainid, consensusAddress, operatorAddress)
+        );
+        (bool ok, bytes memory out) =
+            PQ_VERIFY_PRECOMPILE.staticcall(bytes.concat(proof[:1], message, proof[1:]));
+        return ok && out.length == 32 && abi.decode(out, (uint256)) == 1;
     }
 
     function _deployStakeCredit(address operatorAddress, string memory moniker) internal returns (address) {
