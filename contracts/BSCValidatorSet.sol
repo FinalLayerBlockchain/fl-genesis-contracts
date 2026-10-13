@@ -206,7 +206,23 @@ contract BSCValidatorSet is IBSCValidatorSet, System, IParamSubscriber, IApplica
         uint64[] memory _votingPowers,
         bytes[] memory _voteAddrs
     ) public onlyCoinbase onlyZeroGasPrice {
-        uint256 _length = _consensusAddrs.length;
+        // Final Layer: the engine elects from the parent state. A validator jailed
+        // by an earlier transaction of this very block (and evicted by felony)
+        // must not be installed again by that election.
+        uint256 _length;
+        for (uint256 i; i < _consensusAddrs.length; ++i) {
+            if (!_jailedInStakeHub(_consensusAddrs[i])) {
+                _consensusAddrs[_length] = _consensusAddrs[i];
+                _votingPowers[_length] = _votingPowers[i];
+                _voteAddrs[_length] = _voteAddrs[i];
+                ++_length;
+            }
+        }
+        assembly {
+            mstore(_consensusAddrs, _length)
+            mstore(_votingPowers, _length)
+            mstore(_voteAddrs, _length)
+        }
         Validator[] memory _validatorSet = new Validator[](_length);
         for (uint256 i; i < _length; ++i) {
             _validatorSet[i] = Validator({
@@ -223,8 +239,13 @@ contract BSCValidatorSet is IBSCValidatorSet, System, IParamSubscriber, IApplica
         // - 1. validators exit maintenance
         // - 2. clear all maintainInfo
         // - 3. get unjailed validators from validatorSet
-        (Validator[] memory validatorSetTemp, bytes[] memory voteAddrsTemp) =
-            _forceMaintainingValidatorsExit(_validatorSet, _voteAddrs);
+        // (all elected validators jailed: keep the current set, like the engine
+        // does for an empty election; an empty set would revert and halt)
+        Validator[] memory validatorSetTemp;
+        bytes[] memory voteAddrsTemp;
+        if (_length != 0) {
+            (validatorSetTemp, voteAddrsTemp) = _forceMaintainingValidatorsExit(_validatorSet, _voteAddrs);
+        }
 
         // step 1: distribute incoming
         for (uint256 i; i < currentValidatorSet.length; ++i) {
@@ -568,6 +589,10 @@ contract BSCValidatorSet is IBSCValidatorSet, System, IParamSubscriber, IApplica
 
     function removeTmpMigratedValidator(address validator) external onlyStakeHub {
         revert("deprecated");
+    }
+
+    function _jailedInStakeHub(address consensusAddress) internal view returns (bool) {
+        return IStakeHub(STAKE_HUB_ADDR).isConsensusJailed(consensusAddress);
     }
 
     /*----------------- For Temporary Maintenance -----------------*/

@@ -564,8 +564,10 @@ contract FinalLayerInflationTest is Test {
             address[] memory addrs = new address[](n);
             uint64[] memory powers = new uint64[](n);
             bytes[] memory votes = new bytes[](n);
+            // registered validators, so the jailed check reads StakeHub for each
             for (uint256 i; i < n; ++i) {
-                addrs[i] = address(uint160(uint256(keccak256(abi.encode("val", round, i)))));
+                _createValidator();
+                addrs[i] = consensusAddrs[consensusAddrs.length - 1];
                 powers[i] = 100_000 * 1e8;
                 votes[i] = _voteId(addrs[i]);
             }
@@ -692,8 +694,9 @@ contract FinalLayerInflationTest is Test {
         assertGt(amount, 0);
         uint256 deadBefore = address(0xdEaD).balance;
         _distribute(amount);
-        assertEq(address(0xdEaD).balance - deadBefore, amount, "forfeited inflation not burned");
-        assertEq(stakeHub.inflationCarry(), 0);
+        // only the per-pool rounding dust (a few wei) stays in the carry
+        assertApproxEqAbs(address(0xdEaD).balance - deadBefore, amount, 3, "forfeited inflation not burned");
+        assertLe(stakeHub.inflationCarry(), 3);
     }
 
     function rotateExternal(uint256 i, uint256 seed) external {
@@ -737,7 +740,7 @@ contract FinalLayerInflationTest is Test {
 
     // The downtime exemption must not let an offline validator keep earning by
     // rotating its key every day: a pool whose key was rotated after the
-    // snapshot forfeits that distribution (it is carried to the others).
+    // snapshot forfeits that distribution (it is burned).
     function testRotationForfeitsThatDaysInflation() public {
         for (uint256 i; i < 3; ++i) {
             _createValidator();
@@ -751,12 +754,41 @@ contract FinalLayerInflationTest is Test {
         uint256 amount = stakeHub.pendingStakingInflation(block.timestamp);
         uint256 before0 = _pooled(0);
         uint256 before1 = _pooled(1);
+        uint256 deadBefore = address(0xdEaD).balance;
         _distribute(amount);
         assertEq(_pooled(0), before0, "rotated (non-producing) pool still earned");
-        // R3-04: the forfeited share goes to the other pools now, not into the
-        // carry (which would pay part of it back to the forfeiting pool later)
-        assertApproxEqAbs(_pooled(1) - before1, amount / 2, 3);
+        // the forfeited third is burned: it neither raises the other pools'
+        // share nor stays in the carry to flow back to the forfeiting pool
+        assertApproxEqAbs(_pooled(1) - before1, amount / 3, 3);
+        assertApproxEqAbs(address(0xdEaD).balance - deadBefore, amount / 3, 3);
         assertLe(stakeHub.inflationCarry(), 3);
+    }
+
+    // Regression: a big pool getting itself jailed right before the
+    // breathe block must not multiply a small pool's reward.
+    function testJailedPoolShareIsNotRedistributed() public {
+        for (uint256 i; i < 3; ++i) {
+            _createValidator();
+        }
+        // pool 0 is about 90% of the stake
+        address whale = address(0x9A1E);
+        vm.deal(whale, 2_000_000 ether);
+        vm.prank(whale);
+        stakeHub.delegate{ value: 2_000_000 ether }(operators[0], false);
+        _setElected(consensusAddrs);
+        vm.warp(block.timestamp + 2 days);
+        _breathe();
+        vm.warp(block.timestamp + 1 days);
+        uint256 amount = stakeHub.pendingStakingInflation(block.timestamp);
+        (, uint256[] memory weights, uint256 total) = stakeHub.getInflationSnapshot();
+        uint256 fair1 = (amount * weights[1]) / total;
+        vm.prank(0x0000000000000000000000000000000000001001); // SlashIndicator
+        stakeHub.downtimeSlash(consensusAddrs[0]);
+        uint256 before1 = _pooled(1);
+        uint256 deadBefore = address(0xdEaD).balance;
+        _distribute(amount);
+        assertApproxEqAbs(_pooled(1) - before1, fair1, 3, "small pool got the jailed pool's share");
+        assertApproxEqAbs(address(0xdEaD).balance - deadBefore, (amount * weights[0]) / total, 3);
     }
 
     // R3-02: a rotation while another current validator is missing its turns
@@ -892,6 +924,58 @@ contract FinalLayerInflationTest is Test {
         this.rotateExternal(0, 6000);
         vm.roll(freeUntil + 1);
         _rotate(0, 6000);
+    }
+
+    // Regression: the engine elects from the parent state, so a validator
+    // jailed earlier in the breathe block itself must not be installed again.
+    function testElectionSkipsValidatorJailedInSameBlock() public {
+        for (uint256 i; i < 4; ++i) {
+            _createValidator();
+        }
+        IFLValidatorSet vs = _initValidatorSet();
+        assertEq(vs.getValidators().length, 4);
+        vm.roll(block.number + 1);
+        // self-stake below the minimum: jailed and evicted in this block
+        vm.prank(operators[3]);
+        stakeHub.undelegate(operators[3], 2 ether);
+        assertEq(vs.getValidators().length, 3);
+        // the breathe block's election still carries it (parent state)
+        uint64[] memory powers = new uint64[](4);
+        bytes[] memory votes = new bytes[](4);
+        for (uint256 i; i < 4; ++i) {
+            powers[i] = 1;
+            votes[i] = _voteId(consensusAddrs[i]);
+        }
+        vm.prank(coinbase);
+        vs.updateValidatorSetV2(consensusAddrs, powers, votes);
+        address[] memory working = vs.getValidators();
+        assertEq(working.length, 3, "jailed validator installed again");
+        for (uint256 i; i < working.length; ++i) {
+            assertTrue(working[i] != consensusAddrs[3]);
+        }
+    }
+
+    // Regression: if every validator in the (parent state) election was jailed in
+    // the breathe block, the election must keep the current set, not revert
+    // on an empty set (a permanent halt).
+    function testElectionAllJailedKeepsSet() public {
+        for (uint256 i; i < 3; ++i) {
+            _createValidator();
+        }
+        IFLValidatorSet vs = _initValidatorSet();
+        vm.roll(block.number + 1);
+        vm.prank(SLASH_ADDR);
+        stakeHub.downtimeSlash(consensusAddrs[0]);
+        address[] memory before = vs.getValidators();
+        address[] memory elected = new address[](1);
+        elected[0] = consensusAddrs[0];
+        uint64[] memory powers = new uint64[](1);
+        powers[0] = 1;
+        bytes[] memory votes = new bytes[](1);
+        votes[0] = _voteId(consensusAddrs[0]);
+        vm.prank(coinbase);
+        vs.updateValidatorSetV2(elected, powers, votes);
+        assertEq(keccak256(abi.encode(vs.getValidators())), keccak256(abi.encode(before)));
     }
 
     // felony() on a key that is not in the working set removes nothing and

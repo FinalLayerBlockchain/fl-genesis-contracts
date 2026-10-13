@@ -9,6 +9,7 @@ interface IStakeHub {
     function consensusExpiration(address validator) external view returns (uint256);
     function getValidatorConsensusAddress(address validator) external view returns (address);
     function getValidatorCreditContract(address validator) external view returns (address);
+    function isConsensusJailed(address consensusAddress) external view returns (bool);
     function getValidatorVoteAddress(address validator) external view returns (bytes memory);
     function maxElectedValidators() external view returns (uint256);
     function distributeReward(address validator) external payable;

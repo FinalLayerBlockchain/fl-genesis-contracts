@@ -320,6 +320,7 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     event StakingInflationDistributed(uint256 amount, uint256 elapsed);
     event StakingInflationFailed(address indexed operatorAddress, uint256 amount);
     event StakingInflationRetried(address indexed operatorAddress, uint256 amount);
+    event StakingInflationForfeited(uint256 amount);
 
     // Events for adding and removing NodeIDs.
     event NodeIDAdded(address indexed validator, bytes32 nodeID);
@@ -918,37 +919,41 @@ contract StakeHub is SystemV2, Initializable, Protectable {
             _retryPending(_inflationOperators[i]);
         }
 
-        // Pools that do not earn this time (jailed, or consensus key rotated
-        // since the snapshot) are left out of the split, so their share goes to
-        // the other pools now and can never flow back to them later.
-        uint256 eligibleTotal;
-        for (uint256 i; i < n; ++i) {
-            if (_earnsInflation(_inflationOperators[i])) eligibleTotal += _inflationWeights[i];
-        }
+        // Every pool's share is taken against the whole snapshot. A pool that
+        // does not earn this time (jailed, or consensus key rotated since the
+        // snapshot) forfeits its share for good: it is burned, so it can neither
+        // raise the other pools' rewards (getting jailed on purpose must not
+        // move a pool's reward to another pool) nor flow back later through
+        // the carry.
+        // An empty snapshot (before the first one) pays nobody: the amount stays
+        // in the carry for the next snapshot's pools.
+        uint256 total = inflationWeightTotal;
         uint256 freshPart = msg.value - accPart + inflationCarry;
         uint256 remaining = accPart + freshPart;
-        if (remaining > 0 && eligibleTotal > 0) {
-            uint256 denominator = 10_000 + validatorRewardBps;
+        uint256 forfeited;
+        if (remaining > 0 && total > 0) {
             for (uint256 i; i < n; ++i) {
                 address operatorAddress = _inflationOperators[i];
-                if (!_earnsInflation(operatorAddress)) continue;
                 uint256 w = _inflationWeights[i];
-                uint256 shareAcc = (accPart * w) / eligibleTotal;
-                uint256 shareFresh = (freshPart * w) / eligibleTotal;
+                uint256 shareAcc = (accPart * w) / total;
+                uint256 shareFresh = (freshPart * w) / total;
                 uint256 share = shareAcc + shareFresh;
                 if (share == 0 || share > remaining) continue;
                 remaining -= share;
+                if (!_earnsInflation(operatorAddress)) {
+                    forfeited += share;
+                    continue;
+                }
                 uint256 validatorPart =
-                    (accValidatorPart * w) / eligibleTotal + (shareFresh * validatorRewardBps) / denominator;
+                    (accValidatorPart * w) / total + (shareFresh * validatorRewardBps) / (10_000 + validatorRewardBps);
                 if (validatorPart > share) validatorPart = share;
                 _payInflation(operatorAddress, _inflationCredits[i], share - validatorPart, validatorPart);
             }
         }
-        if (eligibleTotal == 0 && remaining > 0) {
-            // No pool earns this time: the inflation is forfeited for good (burned),
-            // so it cannot flow back to the forfeiting pools through the carry.
-            (bool burned,) = DEAD_ADDRESS.call{ value: remaining }("");
-            if (burned) remaining = 0;
+        if (forfeited > 0) {
+            (bool burned,) = DEAD_ADDRESS.call{ value: forfeited }("");
+            if (burned) emit StakingInflationForfeited(forfeited);
+            else remaining += forfeited;
         }
         inflationCarry = remaining;
 
@@ -1039,6 +1044,17 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         }
         inflationWeightTotal = total;
         inflationSnapshotTime = block.timestamp;
+    }
+
+    /**
+     * @notice Whether the validator with this consensus address is jailed (a
+     * single storage read; BSCValidatorSet checks every elected validator).
+     */
+    function isConsensusJailed(
+        address consensusAddress
+    ) external view returns (bool) {
+        address operatorAddress = consensusToOperator[consensusAddress];
+        return operatorAddress != address(0) && _validators[operatorAddress].jailed;
     }
 
     /**
