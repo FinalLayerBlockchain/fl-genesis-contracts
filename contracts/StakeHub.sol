@@ -380,7 +380,7 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         validatorRewardBps = 1000;
         lastInflationTime = block.timestamp;
         // Different address will be set depending on the environment
-        __Protectable_init_unchained(0xe643DA662420be3f839D522e32BB688894308F2B);
+        __Protectable_init_unchained(0x000000000000000000000000000000000000dEaD);
     }
 
     /*----------------- Implement cross chain app -----------------*/
