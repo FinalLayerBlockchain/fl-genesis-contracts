@@ -73,6 +73,21 @@ contract BSCValidatorSet is IBSCValidatorSet, System, IParamSubscriber, IApplica
     uint256 public turnLength; // Consecutive number of blocks a validator receives priority for block production
     uint256 public systemRewardAntiMEVRatio;
 
+    // Final Layer: block of the last removal of a working validator outside an
+    // election (felony, downtime or self-stake jail, forced maintenance exit).
+    // Parlia keeps the removed key in its epoch set until the next election is
+    // installed, so StakeHub refuses key rotations until then.
+    uint256 public lastEvictionBlock;
+
+    // Parlia installs the set of epoch block E at E + (n/2 + 1) * turnLength - 1
+    // (snapshot.go apply, matched by `number % epochLength`), and a node that
+    // rebuilds its snapshot from history assumes the set is installed by E + 200
+    // (parlia.go snapshot). With up to MAX_CONSENSUS_VALIDATORS cabinets that delay
+    // must stay at most RECOVERY_OFFSET_BLOCKS, or elections can stop being
+    // installed for good or recovery rebuilds the wrong set (NC-02).
+    uint256 public constant MAX_CONSENSUS_VALIDATORS = 50; // StakeHub.MAX_INFLATION_VALIDATORS
+    uint256 public constant RECOVERY_OFFSET_BLOCKS = 200;
+
     struct Validator {
         address consensusAddress;
         address payable feeAddress;
@@ -680,9 +695,12 @@ contract BSCValidatorSet is IBSCValidatorSet, System, IParamSubscriber, IApplica
         } else if (Memory.compareStrings(key, "turnLength")) {
             require(value.length == 32, "length of turnLength mismatch");
             uint256 newTurnLength = BytesToTypes.bytesToUint256(32, value);
+            // [3,7] or 1: (50/2 + 1) * 7 - 1 = 181 <= 200, while 8 gives 207
             require(
-                newTurnLength >= 3 && newTurnLength <= 64 || newTurnLength == 1,
-                "the turnLength should be in [3,64] or equal to 1"
+                newTurnLength == 1
+                    || newTurnLength >= 3
+                        && (MAX_CONSENSUS_VALIDATORS / 2 + 1) * newTurnLength - 1 <= RECOVERY_OFFSET_BLOCKS,
+                "the turnLength should be in [3,7] or equal to 1"
             );
             turnLength = newTurnLength;
         } else {
@@ -926,6 +944,7 @@ contract BSCValidatorSet is IBSCValidatorSet, System, IParamSubscriber, IApplica
             return false;
         }
         emit validatorFelony(validator, income);
+        lastEvictionBlock = block.number;
 
         // remove the validator from currentValidatorSet
         delete currentValidatorSetMap[validator];

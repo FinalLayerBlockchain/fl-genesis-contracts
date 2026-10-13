@@ -537,6 +537,17 @@ contract StakeHub is SystemV2, Initializable, Protectable {
             revert RotationFrozen();
         }
         IBSCValidatorSet vs = IBSCValidatorSet(VALIDATOR_CONTRACT_ADDR);
+        // A validator removed from the working set (downtime, self stake, felony,
+        // forced maintenance exit) stays in Parlia's set while the working set no
+        // longer shows it. The next epoch header carries the working
+        // set without it, and Parlia installs that within the same worst case as
+        // after a breathe block, so rotations wait ROTATION_FREEZE_BLOCKS after
+        // the last removal (a window, not the next breathe block, so repeated
+        // self-evictions cannot hold rotations off for a whole day each).
+        uint256 evictedAt = vs.lastEvictionBlock();
+        if (evictedAt != 0 && block.number <= evictedAt + ROTATION_FREEZE_BLOCKS) {
+            revert RotationFrozen();
+        }
         address[] memory current = vs.getValidators();
         // Parlia's quorum is over the set it took at the last epoch block. That
         // set also holds validators that are in maintenance now and validators

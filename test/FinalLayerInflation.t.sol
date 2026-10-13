@@ -11,6 +11,17 @@ interface VmCool {
     function cool(address target) external;
 }
 
+interface IFLValidatorSet {
+    function init() external;
+    function updateValidatorSetV2(address[] memory, uint64[] memory, bytes[] memory) external;
+    function getValidators() external view returns (address[] memory);
+    function lastEvictionBlock() external view returns (uint256);
+    function updateParam(string calldata key, bytes calldata value) external;
+    function getTurnLength() external view returns (uint256);
+    function MAX_CONSENSUS_VALIDATORS() external view returns (uint256);
+    function RECOVERY_OFFSET_BLOCKS() external view returns (uint256);
+}
+
 contract FinalLayerInflationTest is Test {
     address payable constant VALIDATOR_CONTRACT_ADDR = payable(0x0000000000000000000000000000000000001000);
     address payable constant STAKE_HUB_ADDR = payable(0x0000000000000000000000000000000000002002);
@@ -835,5 +846,98 @@ contract FinalLayerInflationTest is Test {
         uint256 sixtyDays = (stake * 1200 * 11_000 * 60 days) / (100_000_000 * 365 days);
         assertApproxEqAbs(_pooled(0) - before, sixtyDays, 4);
         assertEq(stakeHub.accruedInflation(), 0);
+    }
+
+    function _initValidatorSet() internal returns (IFLValidatorSet vs) {
+        vs = IFLValidatorSet(VALIDATOR_CONTRACT_ADDR);
+        vs.init();
+        uint64[] memory powers = new uint64[](consensusAddrs.length);
+        bytes[] memory votes = new bytes[](consensusAddrs.length);
+        for (uint256 i; i < consensusAddrs.length; ++i) {
+            powers[i] = 1;
+            votes[i] = _voteId(consensusAddrs[i]);
+        }
+        vm.prank(coinbase);
+        vs.updateValidatorSetV2(consensusAddrs, powers, votes);
+    }
+
+    // Regression: self-stake (and downtime) evictions shrink the working set
+    // without touching the double-sign felony count, while Parlia's epoch set
+    // still holds the removed keys. Rotations must wait for the next election.
+    function testRotationFrozenAfterEviction() public {
+        for (uint256 i; i < 5; ++i) {
+            _createValidator();
+        }
+        IFLValidatorSet vs = _initValidatorSet();
+        assertEq(vs.getValidators().length, 5);
+        vm.warp(block.timestamp + 2 days);
+        vm.roll(10000);
+        _breathe();
+        vm.roll(13000);
+        // real StakeHub -> ValidatorSet.felony path, no _felonyMap increment
+        for (uint256 i = 3; i < 5; ++i) {
+            vm.prank(operators[i]);
+            stakeHub.undelegate(operators[i], 2 ether);
+        }
+        assertEq(vs.getValidators().length, 3);
+        assertEq(vs.lastEvictionBlock(), 13000);
+        vm.expectRevert(StakeHub.RotationFrozen.selector);
+        this.rotateExternal(0, 6000);
+        // the next epoch header (13001..14000) carries the working set without
+        // them and Parlia installs it within the freeze window, independent of
+        // breathe blocks (the last one, at 10000, stopped freezing at 12664)
+        uint256 freeUntil = 13000 + stakeHub.ROTATION_FREEZE_BLOCKS();
+        vm.roll(freeUntil);
+        vm.expectRevert(StakeHub.RotationFrozen.selector);
+        this.rotateExternal(0, 6000);
+        vm.roll(freeUntil + 1);
+        _rotate(0, 6000);
+    }
+
+    // felony() on a key that is not in the working set removes nothing and
+    // must not freeze rotations.
+    function testFelonyOnNonMemberRecordsNothing() public {
+        for (uint256 i; i < 3; ++i) {
+            _createValidator();
+        }
+        IFLValidatorSet vs = _initValidatorSet();
+        vm.prank(STAKE_HUB_ADDR);
+        IBSCValidatorSet(VALIDATOR_CONTRACT_ADDR).felony(address(0xBEEF));
+        assertEq(vs.getValidators().length, 3);
+        assertEq(vs.lastEvictionBlock(), 0);
+    }
+
+    // The last remaining validator is never removed, so no eviction is recorded.
+    function testNoEvictionRecordedForLastValidator() public {
+        _createValidator();
+        IFLValidatorSet vs = _initValidatorSet();
+        vm.prank(operators[0]);
+        stakeHub.undelegate(operators[0], 2 ether);
+        assertEq(vs.getValidators().length, 1);
+        assertEq(vs.lastEvictionBlock(), 0);
+    }
+
+    // Regression: with up to 50 cabinets the Parlia activation delay
+    // (n/2 + 1) * turnLength - 1 must stay within the 1000-block epoch (else the
+    // set is never installed) and within the 200-block recovery offset.
+    function testTurnLengthBoundedByActivationDelay() public {
+        IFLValidatorSet vs = IFLValidatorSet(VALIDATOR_CONTRACT_ADDR);
+        vs.init();
+        uint256 maxVals = vs.MAX_CONSENSUS_VALIDATORS();
+        assertEq(maxVals, stakeHub.MAX_INFLATION_VALIDATORS());
+        vm.startPrank(GOV_HUB_ADDR);
+        uint256[4] memory ok = [uint256(1), 3, 4, 7];
+        for (uint256 i; i < ok.length; ++i) {
+            vs.updateParam("turnLength", abi.encode(ok[i]));
+            assertEq(vs.getTurnLength(), ok[i]);
+            assertLe((maxVals / 2 + 1) * ok[i] - 1, vs.RECOVERY_OFFSET_BLOCKS());
+        }
+        uint256[4] memory bad = [uint256(8), 16, 39, 64];
+        for (uint256 i; i < bad.length; ++i) {
+            vm.expectRevert();
+            vs.updateParam("turnLength", abi.encode(bad[i]));
+        }
+        vm.stopPrank();
+        assertEq(vs.getTurnLength(), 7);
     }
 }
