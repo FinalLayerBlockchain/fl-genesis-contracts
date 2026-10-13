@@ -339,6 +339,16 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         _;
     }
 
+    // notInBlackList checks only the raw caller. Agent and consensus routes act
+    // for an operator, so the operator they resolve to is checked too:
+    // blacklisting an operator also freezes its delegated admin.
+    modifier operatorNotInBlackList(
+        address operatorAddress
+    ) {
+        if (blackList[operatorAddress]) revert InBlackList();
+        _;
+    }
+
     modifier enableReceivingFund() {
         _receiveFundStatus = _ENABLE;
         _;
@@ -489,7 +499,7 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     function editConsensusAddress(
         address newConsensusAddress,
         bytes calldata consensusProof
-    ) external whenNotPaused notInBlackList validatorExist(_bep410MsgSender()) {
+    ) external whenNotPaused notInBlackList validatorExist(_bep410MsgSender()) operatorNotInBlackList(_bep410MsgSender()) {
         if (newConsensusAddress == address(0)) revert InvalidConsensusAddress();
         if (consensusToOperator[newConsensusAddress] != address(0)) {
             revert DuplicateConsensusAddress();
@@ -592,7 +602,7 @@ contract StakeHub is SystemV2, Initializable, Protectable {
      */
     function editCommissionRate(
         uint64 commissionRate
-    ) external whenNotPaused notInBlackList validatorExist(_bep410MsgSender()) {
+    ) external whenNotPaused notInBlackList validatorExist(_bep410MsgSender()) operatorNotInBlackList(_bep410MsgSender()) {
         address operatorAddress = _bep410MsgSender();
         Validator storage valInfo = _validators[operatorAddress];
         if (valInfo.updateTime + BREATHE_BLOCK_INTERVAL > block.timestamp) revert UpdateTooFrequently();
@@ -615,7 +625,7 @@ contract StakeHub is SystemV2, Initializable, Protectable {
      */
     function editDescription(
         Description memory description
-    ) external whenNotPaused notInBlackList validatorExist(_bep410MsgSender()) {
+    ) external whenNotPaused notInBlackList validatorExist(_bep410MsgSender()) operatorNotInBlackList(_bep410MsgSender()) {
         address operatorAddress = _bep410MsgSender();
         Validator storage valInfo = _validators[operatorAddress];
         if (valInfo.updateTime + BREATHE_BLOCK_INTERVAL > block.timestamp) revert UpdateTooFrequently();
@@ -634,7 +644,7 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     function editVoteAddress(
         bytes calldata newVoteAddress,
         bytes calldata blsProof
-    ) external whenNotPaused notInBlackList validatorExist(_bep410MsgSender()) {
+    ) external whenNotPaused notInBlackList validatorExist(_bep410MsgSender()) operatorNotInBlackList(_bep410MsgSender()) {
         // Final Layer has no BLS vote keys; the identifier is fixed at creation.
         newVoteAddress;
         blsProof;
@@ -646,7 +656,7 @@ contract StakeHub is SystemV2, Initializable, Protectable {
      */
     function unjail(
         address operatorAddress
-    ) external whenNotPaused notInBlackList validatorExist(operatorAddress) {
+    ) external whenNotPaused notInBlackList validatorExist(operatorAddress) operatorNotInBlackList(operatorAddress) {
         Validator storage valInfo = _validators[operatorAddress];
         if (!valInfo.jailed) revert ValidatorNotJailed();
 
@@ -1478,7 +1488,7 @@ contract StakeHub is SystemV2, Initializable, Protectable {
      */
     function addNodeIDs(
         bytes32[] calldata nodeIDs
-    ) external whenNotPaused notInBlackList validatorExist(_bep563MsgSender()) {
+    ) external whenNotPaused notInBlackList validatorExist(_bep563MsgSender()) operatorNotInBlackList(_bep563MsgSender()) {
         maxNodeIDsInitializer();
 
         if (nodeIDs.length == 0) {
@@ -1527,7 +1537,7 @@ contract StakeHub is SystemV2, Initializable, Protectable {
      */
     function removeNodeIDs(
         bytes32[] calldata targetNodeIDs
-    ) external whenNotPaused notInBlackList validatorExist(_bep563MsgSender()) {
+    ) external whenNotPaused notInBlackList validatorExist(_bep563MsgSender()) operatorNotInBlackList(_bep563MsgSender()) {
         address validator = _bep563MsgSender();
         bytes32[] storage nodeIDs = validatorNodeIDs[validator];
         uint256 length = nodeIDs.length;

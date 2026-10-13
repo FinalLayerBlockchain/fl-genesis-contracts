@@ -118,6 +118,15 @@ contract StakeCredit is SystemV2, Initializable, ReentrancyGuardUpgradeable, ERC
         // add to the queue
         bnbAmount = _burnAndSync(delegator, shares);
         uint256 unlockTime = block.timestamp + IStakeHub(STAKE_HUB_ADDR).unbondPeriod();
+        // claim() pays the queue in FIFO order and stops at the first locked
+        // request, so unlock times must not decrease along the queue. After the
+        // unbond period is lowered, a new request unlocks no earlier than the
+        // one ahead of it; the recorded time is then the time
+        // it can really be claimed.
+        if (_unbondRequestsQueue[delegator].length() != 0) {
+            uint256 lastUnlockTime = _unbondRequests[_unbondRequestsQueue[delegator].back()].unlockTime;
+            if (lastUnlockTime > unlockTime) unlockTime = lastUnlockTime;
+        }
         UnbondRequest memory request = UnbondRequest({ shares: shares, bnbAmount: bnbAmount, unlockTime: unlockTime });
         bytes32 hash = keccak256(abi.encodePacked(delegator, _useSequence(delegator)));
         // the hash should not exist in the queue

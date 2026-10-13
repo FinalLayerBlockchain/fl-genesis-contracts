@@ -35,24 +35,12 @@ contract GovHub is System, IApplication {
         revert("deprecated");
     }
 
+    // A failed update reverts the whole call. Swallowing it
+    // let the timelock and governor mark an unapplied action as executed, broke
+    // the atomicity of multi-action proposals and left no retry. The target's
+    // revert data is bubbled unchanged.
     function updateParam(string calldata key, bytes calldata value, address target) external onlyGovernorTimelock {
-        ParamChangePackage memory proposal = ParamChangePackage(key, value, target);
-        notifyUpdates(proposal);
-    }
-
-    function notifyUpdates(ParamChangePackage memory proposal) internal returns (uint32) {
-        if (!isContract(proposal.target)) {
-            emit failReasonWithStr("the target is not a contract");
-            return ERROR_TARGET_NOT_CONTRACT;
-        }
-        try IParamSubscriber(proposal.target).updateParam(proposal.key, proposal.value) { }
-        catch Error(string memory reason) {
-            emit failReasonWithStr(reason);
-            return ERROR_TARGET_CONTRACT_FAIL;
-        } catch (bytes memory lowLevelData) {
-            emit failReasonWithBytes(lowLevelData);
-            return ERROR_TARGET_CONTRACT_FAIL;
-        }
-        return CODE_OK;
+        require(isContract(target), "the target is not a contract");
+        IParamSubscriber(target).updateParam(key, value);
     }
 }
