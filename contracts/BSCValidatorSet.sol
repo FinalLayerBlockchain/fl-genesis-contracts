@@ -705,6 +705,9 @@ contract BSCValidatorSet is IBSCValidatorSet, System, IParamSubscriber, IApplica
             require(
                 newNumOfCabinets <= maxElectedValidators, "the numOfCabinets must be less than maxElectedValidators"
             );
+            // Final Layer: keep maxNumOfMaintaining < numOfCabinets in both update directions
+            uint256 _maxNumOfMaintaining = maxNumOfMaintaining > 0 ? maxNumOfMaintaining : INIT_MAX_NUM_OF_MAINTAINING;
+            require(newNumOfCabinets > _maxNumOfMaintaining, "the numOfCabinets must be greater than maxNumOfMaintaining");
 
             numOfCabinets = newNumOfCabinets;
         } else if (Memory.compareStrings(key, "systemRewardBaseRatio")) {

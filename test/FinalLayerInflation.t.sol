@@ -641,6 +641,43 @@ contract FinalLayerInflationTest is Test {
         assertEq(miningVotes.length, 1);
     }
 
+    // numOfCabinets must stay above maxNumOfMaintaining when cabinets change.
+    function testCabinetsAboveMaintaining() public {
+        vm.mockCall(STAKE_HUB_ADDR, abi.encodeWithSignature("maxElectedValidators()"), abi.encode(uint256(21)));
+        vm.store(VALIDATOR_CONTRACT_ADDR, bytes32(uint256(0)), bytes32(uint256(1))); // alreadyInit
+        vm.startPrank(GOV_HUB_ADDR);
+        // maxNumOfMaintaining unset -> INIT 3
+        (bool ok,) = VALIDATOR_CONTRACT_ADDR.call(
+            abi.encodeWithSignature("updateParam(string,bytes)", "numOfCabinets", abi.encodePacked(uint256(3)))
+        );
+        assertFalse(ok, "cabinets == maintaining must revert");
+        (ok,) = VALIDATOR_CONTRACT_ADDR.call(
+            abi.encodeWithSignature("updateParam(string,bytes)", "numOfCabinets", abi.encodePacked(uint256(4)))
+        );
+        assertTrue(ok, "cabinets > maintaining must pass");
+        vm.stopPrank();
+    }
+
+    // BSCGovernor bounds are block counts: 24 h / 30 d / 2 d at 3 s blocks.
+    function testGovernorBoundsInBlocks() public {
+        address gov = 0x0000000000000000000000000000000000002004;
+        vm.etch(gov, vm.getDeployedCode("BSCGovernor.sol:BSCGovernor"));
+        vm.startPrank(GOV_HUB_ADDR);
+        (bool ok,) = gov.call(abi.encodeWithSignature("updateParam(string,bytes)", "votingDelay", abi.encode(uint256(28_801))));
+        assertFalse(ok);
+        (ok,) = gov.call(abi.encodeWithSignature("updateParam(string,bytes)", "votingDelay", abi.encode(uint256(28_800))));
+        assertTrue(ok);
+        (ok,) = gov.call(abi.encodeWithSignature("updateParam(string,bytes)", "votingPeriod", abi.encode(uint256(864_001))));
+        assertFalse(ok);
+        (ok,) = gov.call(abi.encodeWithSignature("updateParam(string,bytes)", "votingPeriod", abi.encode(uint256(864_000))));
+        assertTrue(ok);
+        (ok,) = gov.call(abi.encodeWithSignature("updateParam(string,bytes)", "minPeriodAfterQuorum", abi.encodePacked(uint64(57_601))));
+        assertFalse(ok);
+        (ok,) = gov.call(abi.encodeWithSignature("updateParam(string,bytes)", "minPeriodAfterQuorum", abi.encodePacked(uint64(57_600))));
+        assertTrue(ok);
+        vm.stopPrank();
+    }
+
     function testBreatheBlockGasAtMaxElected() public {
         uint256 n = stakeHub.MAX_INFLATION_VALIDATORS();
         uint256 d = _worstCaseDistributeGas(n);

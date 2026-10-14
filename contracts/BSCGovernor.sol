@@ -172,12 +172,12 @@ contract BSCGovernor is
         if (key.compareStrings("votingDelay")) {
             if (value.length != 32) revert InvalidValue(key, value);
             uint256 newVotingDelay = value.bytesToUint256(32);
-            if (newVotingDelay == 0 || newVotingDelay > 24 hours) revert InvalidValue(key, value);
+            if (newVotingDelay == 0 || newVotingDelay > 24 hours / BLOCK_INTERVAL) revert InvalidValue(key, value);
             _setVotingDelay(newVotingDelay);
         } else if (key.compareStrings("votingPeriod")) {
             if (value.length != 32) revert InvalidValue(key, value);
             uint256 newVotingPeriod = value.bytesToUint256(32);
-            if (newVotingPeriod == 0 || newVotingPeriod > 30 days) revert InvalidValue(key, value);
+            if (newVotingPeriod == 0 || newVotingPeriod > 30 days / BLOCK_INTERVAL) revert InvalidValue(key, value);
             _setVotingPeriod(newVotingPeriod);
         } else if (key.compareStrings("proposalThreshold")) {
             if (value.length != 32) revert InvalidValue(key, value);
@@ -192,7 +192,7 @@ contract BSCGovernor is
         } else if (key.compareStrings("minPeriodAfterQuorum")) {
             if (value.length != 8) revert InvalidValue(key, value);
             uint64 newMinPeriodAfterQuorum = value.bytesToUint64(8);
-            if (newMinPeriodAfterQuorum == 0 || newMinPeriodAfterQuorum > 2 days) revert InvalidValue(key, value);
+            if (newMinPeriodAfterQuorum == 0 || newMinPeriodAfterQuorum > 2 days / BLOCK_INTERVAL) revert InvalidValue(key, value);
             _setLateQuorumVoteExtension(newMinPeriodAfterQuorum);
         } else if (key.compareStrings("governorProtector")) {
             if (value.length != 20) revert InvalidValue(key, value);
