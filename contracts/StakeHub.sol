@@ -201,6 +201,10 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     uint256 public lastValidatorSetUpdateBlock;
     // Block of each operator's last editConsensusAddress.
     mapping(address => uint256) public consensusRotatedBlock;
+    // Registration cap, raise-only by governance (registrations are
+    // never removed, so a fixed cap could be filled once and lock out every new
+    // validator). 0 means MAX_REGISTERED_VALIDATORS.
+    uint256 public maxRegisteredValidators;
 
     /*----------------- Final Layer constants -----------------*/
     uint256 public constant MAX_STAKING_APR_BPS = 2000; // 20% hard cap
@@ -211,7 +215,8 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     // limit, so no breathe block could be built (FinalLayerInflation.t.sol).
     uint256 public constant MAX_INFLATION_VALIDATORS = 50;
     // Bounds the daily election read, which scans every registered validator.
-    uint256 public constant MAX_REGISTERED_VALIDATORS = 500;
+    uint256 public constant MAX_REGISTERED_VALIDATORS = 500; // default cap
+    uint256 public constant MAX_REGISTRATION_CAP = 2000; // governance ceiling (election reads ~95k gas per validator)
     uint256 public constant MIN_SELF_DELEGATION_FLOOR = 100_000 ether;
     // After a breathe block the contract's elected set and Parlia's set differ
     // until Parlia applies header E + minerHistoryCheckLen of the next epoch block
@@ -444,7 +449,7 @@ contract StakeHub is SystemV2, Initializable, Protectable {
         address operatorAddress = msg.sender;
         if (_validatorSet.contains(operatorAddress)) revert ValidatorExisted();
         if (agentToOperator[operatorAddress] != address(0)) revert InvalidValidator();
-        if (_validatorSet.length() >= MAX_REGISTERED_VALIDATORS) revert TooManyValidators();
+        if (_validatorSet.length() >= _registrationCap()) revert TooManyValidators();
 
         if (consensusToOperator[consensusAddress] != address(0)) {
             revert DuplicateConsensusAddress();
@@ -1220,6 +1225,14 @@ contract StakeHub is SystemV2, Initializable, Protectable {
                 revert InvalidValue(key, value);
             }
             minDelegationBNBChange = newMinDelegationBNBChange;
+        } else if (key.compareStrings("maxRegisteredValidators")) {
+            if (value.length != 32) revert InvalidValue(key, value);
+            uint256 newMaxRegisteredValidators = value.bytesToUint256(32);
+            // raise only; every full-set walk (election info, validator lists) is paginated
+            if (newMaxRegisteredValidators <= _registrationCap() || newMaxRegisteredValidators > MAX_REGISTRATION_CAP) {
+                revert InvalidValue(key, value);
+            }
+            maxRegisteredValidators = newMaxRegisteredValidators;
         } else if (key.compareStrings("maxElectedValidators")) {
             if (value.length != 32) revert InvalidValue(key, value);
             uint256 newMaxElectedValidators = value.bytesToUint256(32);
@@ -1612,6 +1625,11 @@ contract StakeHub is SystemV2, Initializable, Protectable {
     }
 
     /*----------------- internal functions -----------------*/
+    function _registrationCap() internal view returns (uint256) {
+        uint256 cap = maxRegisteredValidators;
+        return cap == 0 ? MAX_REGISTERED_VALIDATORS : cap;
+    }
+
     function _checkMoniker(
         string memory moniker
     ) internal pure returns (bool) {

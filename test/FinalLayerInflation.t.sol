@@ -483,6 +483,36 @@ contract FinalLayerInflationTest is Test {
         );
     }
 
+    // F-01: governance can raise (never lower) the registration cap, so a filled
+    // set does not lock out new validators forever.
+    function testRegistrationCapRaiseOnly() public {
+        _createValidator();
+        uint256 cap = stakeHub.MAX_REGISTERED_VALIDATORS();
+        uint256 ceiling = stakeHub.MAX_REGISTRATION_CAP();
+        vm.store(STAKE_HUB_ADDR, bytes32(uint256(63)), bytes32(cap));
+        address operator = address(0xFFFF02);
+        bytes memory pk = _fakePubKey(999_998);
+        address consensus = _consensusOf(pk);
+        _acceptPop(pk, consensus, operator);
+        vm.deal(operator, 100_001 ether);
+
+        vm.startPrank(GOV_HUB_ADDR);
+        vm.expectRevert();
+        stakeHub.updateParam("maxRegisteredValidators", abi.encode(cap)); // not a raise
+        vm.expectRevert();
+        stakeHub.updateParam("maxRegisteredValidators", abi.encode(ceiling + 1));
+        stakeHub.updateParam("maxRegisteredValidators", abi.encode(cap + 1));
+        vm.expectRevert();
+        stakeHub.updateParam("maxRegisteredValidators", abi.encode(cap)); // cannot lower
+        vm.stopPrank();
+        assertEq(stakeHub.maxRegisteredValidators(), cap + 1);
+
+        vm.prank(operator);
+        stakeHub.createValidator{ value: 100_001 ether }(
+            consensus, _voteId(consensus), _proof(pk), _commission(), _description(999_998)
+        );
+    }
+
     // The engine reads the validator list for the election at every breathe
     // block through eth_call, capped at RPCGasCap (50M by default). The full
     // list costs ~95k gas per registered validator, so ~530 sybil validators
