@@ -613,6 +613,34 @@ contract FinalLayerInflationTest is Test {
         }
     }
 
+    // More working candidates than cabinets (both governance params) must not
+    // make getMiningValidators revert: the engine reads it at every epoch.
+    function testMiningValidatorsCandidatesAboveCabinets() public {
+        vm.mockCall(address(0x1001), abi.encodeWithSignature("clean()"), "");
+        address[] memory addrs = new address[](3);
+        uint64[] memory powers = new uint64[](3);
+        bytes[] memory votes = new bytes[](3);
+        for (uint256 i; i < 3; ++i) {
+            _createValidator();
+            addrs[i] = consensusAddrs[consensusAddrs.length - 1];
+            powers[i] = 100_000 * 1e8;
+            votes[i] = _voteId(addrs[i]);
+        }
+        vm.prank(coinbase);
+        (bool ok, bytes memory ret) = VALIDATOR_CONTRACT_ADDR.call(
+            abi.encodeWithSignature("updateValidatorSetV2(address[],uint64[],bytes[])", addrs, powers, votes)
+        );
+        assertTrue(ok, string(ret));
+        vm.store(VALIDATOR_CONTRACT_ADDR, bytes32(uint256(12)), bytes32(uint256(1))); // numOfCabinets
+        vm.store(VALIDATOR_CONTRACT_ADDR, bytes32(uint256(14)), bytes32(uint256(2))); // maxNumOfWorkingCandidates
+
+        (ok, ret) = VALIDATOR_CONTRACT_ADDR.staticcall(abi.encodeWithSignature("getMiningValidators()"));
+        assertTrue(ok, "getMiningValidators reverted");
+        (address[] memory mining, bytes[] memory miningVotes) = abi.decode(ret, (address[], bytes[]));
+        assertEq(mining.length, 1);
+        assertEq(miningVotes.length, 1);
+    }
+
     function testBreatheBlockGasAtMaxElected() public {
         uint256 n = stakeHub.MAX_INFLATION_VALIDATORS();
         uint256 d = _worstCaseDistributeGas(n);

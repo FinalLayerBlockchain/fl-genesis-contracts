@@ -433,6 +433,12 @@ contract BSCValidatorSet is IBSCValidatorSet, System, IParamSubscriber, IApplica
         if ((validators.length - _numOfCabinets) < _maxNumOfWorkingCandidates) {
             _maxNumOfWorkingCandidates = validators.length - _numOfCabinets;
         }
+        // Final Layer: never more working candidates than cabinets, otherwise
+        // _numOfCabinets - _maxNumOfWorkingCandidates wraps (0.6.4, unchecked)
+        // and the engine's epoch read reverts, halting block production.
+        if (_maxNumOfWorkingCandidates > _numOfCabinets) {
+            _maxNumOfWorkingCandidates = _numOfCabinets;
+        }
         if (_maxNumOfWorkingCandidates > 0) {
             uint256 shuffleNumber = block.number / _shuffleInterval;
             shuffle(

@@ -382,6 +382,10 @@ contract SlashIndicator is ISlashIndicator, System, IParamSubscriber, IApplicati
                 newFelonyThreshold <= 1000 && newFelonyThreshold > misdemeanorThreshold,
                 "the felonyThreshold out of range"
             );
+            // Final Layer: clean() decays by felonyThreshold / DECREASE_RATE per
+            // day; below DECREASE_RATE that is 0, entries never expire and the
+            // breathe-block clean() grows without bound.
+            require(newFelonyThreshold >= DECREASE_RATE, "the felonyThreshold must be at least DECREASE_RATE");
             felonyThreshold = newFelonyThreshold;
         } else if (Memory.compareStrings(key, "felonySlashRewardRatio")) {
             require(value.length == 32, "length of felonySlashRewardRatio mismatch");
