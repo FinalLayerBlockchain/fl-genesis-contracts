@@ -87,6 +87,7 @@ contract BSCValidatorSet is IBSCValidatorSet, System, IParamSubscriber, IApplica
     // installed for good or recovery rebuilds the wrong set (NC-02).
     uint256 public constant MAX_CONSENSUS_VALIDATORS = 50; // StakeHub.MAX_INFLATION_VALIDATORS
     uint256 public constant RECOVERY_OFFSET_BLOCKS = 200;
+    uint256 public constant MAX_TURN_LENGTH = 7; // (MAX_CONSENSUS_VALIDATORS / 2 + 1) * 7 - 1 = 181 <= 200
 
     struct Validator {
         address consensusAddress;
@@ -282,11 +283,7 @@ contract BSCValidatorSet is IBSCValidatorSet, System, IParamSubscriber, IApplica
         uint256 value = msg.value;
         uint256 index = currentValidatorSetMap[valAddr];
 
-        if (isSystemRewardIncluded == false) {
-            systemRewardBaseRatio = INIT_SYSTEM_REWARD_RATIO;
-            burnRatio = INIT_BURN_RATIO;
-            isSystemRewardIncluded = true;
-        }
+        _initSystemRewardRatios();
 
         uint256 systemRewardRatio = systemRewardBaseRatio;
         if (turnLength > 1 && systemRewardAntiMEVRatio > 0) {
@@ -658,6 +655,7 @@ contract BSCValidatorSet is IBSCValidatorSet, System, IParamSubscriber, IApplica
     function updateParam(string calldata key, bytes calldata value) external override onlyInit onlyGov {
         if (Memory.compareStrings(key, "burnRatio")) {
             require(value.length == 32, "length of burnRatio mismatch");
+            _initSystemRewardRatios();
             uint256 newBurnRatio = BytesToTypes.bytesToUint256(32, value);
             require(
                 newBurnRatio.add(systemRewardBaseRatio).add(systemRewardAntiMEVRatio) <= BLOCK_FEES_RATIO_SCALE,
@@ -712,6 +710,7 @@ contract BSCValidatorSet is IBSCValidatorSet, System, IParamSubscriber, IApplica
             numOfCabinets = newNumOfCabinets;
         } else if (Memory.compareStrings(key, "systemRewardBaseRatio")) {
             require(value.length == 32, "length of systemRewardBaseRatio mismatch");
+            _initSystemRewardRatios();
             uint256 newSystemRewardBaseRatio = BytesToTypes.bytesToUint256(32, value);
             require(
                 newSystemRewardBaseRatio.add(burnRatio).add(systemRewardAntiMEVRatio) <= BLOCK_FEES_RATIO_SCALE,
@@ -720,6 +719,7 @@ contract BSCValidatorSet is IBSCValidatorSet, System, IParamSubscriber, IApplica
             systemRewardBaseRatio = newSystemRewardBaseRatio;
         } else if (Memory.compareStrings(key, "systemRewardAntiMEVRatio")) {
             require(value.length == 32, "length of systemRewardAntiMEVRatio mismatch");
+            _initSystemRewardRatios();
             uint256 newSystemRewardAntiMEVRatio = BytesToTypes.bytesToUint256(32, value);
             require(
                 newSystemRewardAntiMEVRatio.add(burnRatio).add(systemRewardBaseRatio) <= BLOCK_FEES_RATIO_SCALE,
@@ -729,11 +729,12 @@ contract BSCValidatorSet is IBSCValidatorSet, System, IParamSubscriber, IApplica
         } else if (Memory.compareStrings(key, "turnLength")) {
             require(value.length == 32, "length of turnLength mismatch");
             uint256 newTurnLength = BytesToTypes.bytesToUint256(32, value);
-            // [3,7] or 1: (50/2 + 1) * 7 - 1 = 181 <= 200, while 8 gives 207
+            // [3,7] or 1: (50/2 + 1) * 7 - 1 = 181 <= 200, while 8 gives 207.
+            // Explicit bounds: solc 0.6 arithmetic is unchecked, so a product
+            // form wraps for huge values (e.g. 2^255 + 1), and Parlia truncates
+            // the value to one header byte that parseTurnLength rejects.
             require(
-                newTurnLength == 1
-                    || newTurnLength >= 3
-                        && (MAX_CONSENSUS_VALIDATORS / 2 + 1) * newTurnLength - 1 <= RECOVERY_OFFSET_BLOCKS,
+                newTurnLength == 1 || (newTurnLength >= 3 && newTurnLength <= MAX_TURN_LENGTH),
                 "the turnLength should be in [3,7] or equal to 1"
             );
             turnLength = newTurnLength;
@@ -744,6 +745,18 @@ contract BSCValidatorSet is IBSCValidatorSet, System, IParamSubscriber, IApplica
     }
 
     /*----------------- Internal Functions -----------------*/
+    // The fee ratios are lazily set by the first fee deposit. The ratio setters
+    // run the same init first, so their sum check sees the ratios that deposit
+    // will actually apply (a pre-deposit systemRewardAntiMEVRatio validated
+    // against zero base/burn would make every later deposit revert).
+    function _initSystemRewardRatios() private {
+        if (isSystemRewardIncluded == false) {
+            systemRewardBaseRatio = INIT_SYSTEM_REWARD_RATIO;
+            burnRatio = INIT_BURN_RATIO;
+            isSystemRewardIncluded = true;
+        }
+    }
+
     function doUpdateState(Validator[] memory newValidatorSet, bytes[] memory newVoteAddrs) private {
         uint256 n = currentValidatorSet.length;
         uint256 m = newValidatorSet.length;

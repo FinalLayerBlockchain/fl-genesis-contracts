@@ -20,6 +20,18 @@ interface IFLValidatorSet {
     function getTurnLength() external view returns (uint256);
     function MAX_CONSENSUS_VALIDATORS() external view returns (uint256);
     function RECOVERY_OFFSET_BLOCKS() external view returns (uint256);
+    function deposit(address valAddr) external payable;
+    function isSystemRewardIncluded() external view returns (bool);
+    function systemRewardBaseRatio() external view returns (uint256);
+    function burnRatio() external view returns (uint256);
+    function systemRewardAntiMEVRatio() external view returns (uint256);
+}
+
+interface IFLSystemReward {
+    function claimRewards(address payable to, uint256 amount) external returns (uint256);
+    function isOperator(address addr) external view returns (bool);
+    function alreadyInit() external view returns (bool);
+    function updateParam(string calldata key, bytes calldata value) external;
 }
 
 contract FinalLayerInflationTest is Test {
@@ -1118,5 +1130,84 @@ contract FinalLayerInflationTest is Test {
         }
         vm.stopPrank();
         assertEq(vs.getTurnLength(), 7);
+    }
+
+    // FL5-01: solc 0.6 unchecked arithmetic. 26 * x - 1 wraps below 200 for
+    // x = 2^255 + 1 (-> 25) and x = 0x4ec4...4ec5 (-> 1). Parlia truncates the
+    // stored value to one header byte (uint8), which parseTurnLength rejects
+    // unless it is 1 or 3..7, so an accepted huge value halts the chain at the
+    // next epoch block. The setter must bound the value explicitly.
+    function testTurnLengthRejectsWrappingValues() public {
+        IFLValidatorSet vs = IFLValidatorSet(VALIDATOR_CONTRACT_ADDR);
+        vs.init();
+        vm.startPrank(GOV_HUB_ADDR);
+        uint256[6] memory bad = [
+            uint256(0),
+            2,
+            (1 << 255) + 1, // 26x - 1 wraps to 25; header byte 1
+            0x4ec4ec4ec4ec4ec4ec4ec4ec4ec4ec4ec4ec4ec4ec4ec4ec4ec4ec4ec4ec4ec5, // wraps to 1; header byte 197
+            type(uint256).max,
+            8
+        ];
+        for (uint256 i; i < bad.length; ++i) {
+            vm.expectRevert(bytes("the turnLength should be in [3,7] or equal to 1"));
+            vs.updateParam("turnLength", abi.encode(bad[i]));
+        }
+        vm.stopPrank();
+        assertEq(vs.getTurnLength(), 1);
+    }
+
+    // FL5-03: before the first fee deposit the ratio setters validated the sum
+    // against zero base/burn ratios; the first deposit then set base 625 and
+    // burn 1000, so a pre-deposit systemRewardAntiMEVRatio above 8375 made the
+    // deposit system tx revert on the last block of every turn (chain halt).
+    function testPreDepositRatioSettersSeeEffectiveDefaults() public {
+        IFLValidatorSet vs = IFLValidatorSet(VALIDATOR_CONTRACT_ADDR);
+        vs.init();
+        assertFalse(vs.isSystemRewardIncluded());
+        vm.startPrank(GOV_HUB_ADDR);
+        vs.updateParam("turnLength", abi.encode(uint256(3)));
+        vm.expectRevert(
+            bytes("the systemRewardAntiMEVRatio plus burnRatio and systemRewardBaseRatio must be no greater than 10000")
+        );
+        vs.updateParam("systemRewardAntiMEVRatio", abi.encode(uint256(8376)));
+        vs.updateParam("systemRewardAntiMEVRatio", abi.encode(uint256(8375)));
+        vm.stopPrank();
+        assertEq(vs.systemRewardBaseRatio(), 625);
+        assertEq(vs.burnRatio(), 1000);
+        // last block of a turn: ratio = 625 + 8375, plus burn 1000 = exactly 100%
+        vm.roll(5);
+        vm.deal(coinbase, 1 ether);
+        vm.prank(coinbase);
+        vs.deposit{ value: 1 ether }(coinbase);
+        assertEq(address(0x0000000000000000000000000000000000001002).balance, 0.9 ether);
+        assertEq(address(0x000000000000000000000000000000000000dEaD).balance, 0.1 ether);
+    }
+
+    // FL5-05: SystemReward creates its operator set lazily in the first
+    // claimRewards; a governance deleteOperator before that was silently
+    // undone. Also, the system callers can never be removed, since
+    // distributeFinalityReward (a system tx) claims from SystemReward.
+    function testSystemRewardOperatorChangesSurviveLazyInit() public {
+        address payable sr = payable(0x0000000000000000000000000000000000001002);
+        address lightClient = 0x0000000000000000000000000000000000001003;
+        vm.etch(sr, vm.getDeployedCode("SystemReward.sol:SystemReward"));
+        IFLSystemReward reward = IFLSystemReward(sr);
+        assertFalse(reward.alreadyInit());
+        vm.startPrank(GOV_HUB_ADDR);
+        reward.updateParam("deleteOperator", abi.encodePacked(lightClient));
+        vm.expectRevert(bytes("system contracts are permanent operators"));
+        reward.updateParam("deleteOperator", abi.encodePacked(VALIDATOR_CONTRACT_ADDR));
+        vm.expectRevert(bytes("system contracts are permanent operators"));
+        reward.updateParam("deleteOperator", abi.encodePacked(SLASH_ADDR));
+        vm.stopPrank();
+        // first claim (what distributeFinalityReward does every 200 blocks)
+        vm.deal(sr, 1 ether);
+        vm.prank(VALIDATOR_CONTRACT_ADDR);
+        reward.claimRewards(payable(address(0xB0B)), 1 ether);
+        assertTrue(reward.alreadyInit());
+        assertFalse(reward.isOperator(lightClient), "pre-init deleteOperator was undone by lazy init");
+        assertTrue(reward.isOperator(VALIDATOR_CONTRACT_ADDR));
+        assertTrue(reward.isOperator(SLASH_ADDR));
     }
 }
