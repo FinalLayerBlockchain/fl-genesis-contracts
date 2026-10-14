@@ -1073,12 +1073,12 @@ contract BSCValidatorSet is IBSCValidatorSet, System, IParamSubscriber, IApplica
 
         // 2. get unjailed validators from validatorSet
         if (numOfFelony >= _validatorSet.length) {
-            // make sure there is at least one validator
-            unjailedValidatorSet = new Validator[](1);
-            unjailedVoteAddrs = new bytes[](1);
-            unjailedValidatorSet[0] = _validatorSet[0];
-            unjailedVoteAddrs[0] = _voteAddrs[0];
-            unjailedValidatorSet[0].jailed = false;
+            // Final Layer: every elected validator was just evicted for
+            // maintenance abuse. Keep the current set (the caller skips an
+            // empty update) instead of installing the first evicted one as
+            // the sole validator, which drops the working signers.
+            unjailedValidatorSet = new Validator[](0);
+            unjailedVoteAddrs = new bytes[](0);
         } else {
             unjailedValidatorSet = new Validator[](_validatorSet.length - numOfFelony);
             unjailedVoteAddrs = new bytes[](_validatorSet.length - numOfFelony);

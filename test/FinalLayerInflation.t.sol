@@ -21,6 +21,7 @@ interface IFLValidatorSet {
     function MAX_CONSENSUS_VALIDATORS() external view returns (uint256);
     function RECOVERY_OFFSET_BLOCKS() external view returns (uint256);
     function deposit(address valAddr) external payable;
+    function enterMaintenance() external;
     function isSystemRewardIncluded() external view returns (bool);
     function systemRewardBaseRatio() external view returns (uint256);
     function burnRatio() external view returns (uint256);
@@ -1209,5 +1210,62 @@ contract FinalLayerInflationTest is Test {
         assertFalse(reward.isOperator(lightClient), "pre-init deleteOperator was undone by lazy init");
         assertTrue(reward.isOperator(VALIDATOR_CONTRACT_ADDR));
         assertTrue(reward.isOperator(SLASH_ADDR));
+    }
+
+    // N-12: current set [A maintaining, B working], B not registered
+    // in StakeHub (genesis validator before createValidator), so the election
+    // returns only [A]. A abused maintenance long enough for the forced exit
+    // to be a felony: _exitMaintenance evicts A, then the "at least one
+    // validator" fallback reinstalled the evicted A as the sole validator and
+    // B, the only signer, was dropped: stall. Now the empty election result
+    // keeps the current set, i.e. B.
+    function testForcedMaintenanceFelonyKeepsWorkingSigner() public {
+        _createValidator();
+        address a = consensusAddrs[0];
+        address b = address(0xB0B);
+        IFLValidatorSet vs = IFLValidatorSet(VALIDATOR_CONTRACT_ADDR);
+        vs.init();
+        address[] memory set = new address[](2);
+        set[0] = a;
+        set[1] = b;
+        uint64[] memory powers = new uint64[](2);
+        powers[0] = 1;
+        powers[1] = 1;
+        bytes[] memory votes = new bytes[](2);
+        votes[0] = _voteId(a);
+        votes[1] = _voteId(b);
+        vm.prank(coinbase);
+        vs.updateValidatorSetV2(set, powers, votes);
+        assertEq(vs.getValidators().length, 2);
+
+        vm.etch(SLASH_ADDR, vm.getDeployedCode("SlashIndicator.sol:SlashIndicator"));
+        (bool ok,) = SLASH_ADDR.call(abi.encodeWithSignature("init()"));
+        assertTrue(ok);
+
+        vm.prank(a);
+        vs.enterMaintenance();
+        assertEq(vs.getValidators().length, 1); // only B works
+        // slashCount = blocks / miningValidatorCount(1) / maintainSlashScale(2) >= felonyThreshold(150)
+        vm.roll(block.number + 300);
+
+        // daily election from StakeHub: only A is registered
+        address[] memory elected = new address[](1);
+        elected[0] = a;
+        uint64[] memory ePowers = new uint64[](1);
+        ePowers[0] = 1;
+        bytes[] memory eVotes = new bytes[](1);
+        eVotes[0] = _voteId(a);
+        vm.prank(coinbase);
+        vs.updateValidatorSetV2(elected, ePowers, eVotes);
+
+        address[] memory after_ = vs.getValidators();
+        bool hasB;
+        for (uint256 i; i < after_.length; ++i) {
+            if (after_[i] == b) hasB = true;
+            assertTrue(after_[i] != a, "evicted maintaining validator reinstalled");
+        }
+        assertTrue(hasB, "working signer B dropped by the forced-exit fallback");
+        assertEq(after_.length, 1);
+        assertEq(vs.lastEvictionBlock(), block.number);
     }
 }
