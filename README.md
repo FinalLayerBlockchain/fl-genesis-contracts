@@ -1,107 +1,47 @@
-# bsc-genesis-contracts
+# Final Layer genesis contracts (fl-genesis-contracts)
 
-This repo hold all the genesis contracts on BNB Smart chain. More details in [doc-site](https://docs.bnbchain.org/docs/learn/system-contract).
+System contracts deployed in the genesis of Final Layer (chain ID `20261012`), the post-quantum
+EVM Layer 1 built on the [BNB Smart Chain client](https://github.com/bnb-chain/bsc). This is a fork
+of [bnb-chain/bsc-genesis-contract](https://github.com/bnb-chain/bsc-genesis-contract), changed so
+that validators, staking and governance work with ML-DSA-87 consensus keys and pay daily staking
+inflation.
 
-## Prepare
+Final Layer previously ran on a java-tron based codebase. That network is retired; these
+contracts belong to the current bsc-geth based chain, whose node is
+[fl-node](https://github.com/FinalLayerBlockchain/fl-node).
 
-Install node.js dependency:
-```shell script
+## What Final Layer changed
+
+| Area | Summary |
+| --- | --- |
+| Consensus keys | Validators register an ML-DSA-87 consensus key with a proof of possession; key rotation is frozen while Parlia's set and the contract's set differ, and blocked if it would take the chain below liveness |
+| Staking inflation | 12% APR (`stakingAprBps = 1200`, hard cap 20%) minted daily by the node and split across the elected pools by a previous-breathe snapshot; a validator bonus share (cap 50%); retries, carry and a full backlog after a halt |
+| Election bounds | At most 50 inflation validators, a raise-only registration cap (default 500, ceiling 2,000), 100,000 FL minimum self-delegation |
+| Slashing | Double-sign evidence is ML-DSA seals over the real chain ID; rotated keys are not charged downtime |
+| Governance | Governor bounds expressed in blocks (3 s), failed GovHub updates revert, cabinet count stays above the maintaining count, no protector address (`0xdEaD`: nobody can pause or blacklist unless governance appoints one) |
+
+The file-by-file map is in [`docs/FINAL-LAYER-CHANGES.md`](docs/FINAL-LAYER-CHANGES.md).
+
+## For auditors
+
+1. The first commit is the unmodified upstream snapshot; every Final Layer change is a separate
+   commit on top, so `git diff $(git rev-list --max-parents=0 HEAD) HEAD` is the full delta
+   (12 files).
+2. Final Layer tests: `test/FinalLayerInflation.t.sol` and `test/FinalLayerGovernance.t.sol`.
+3. [`SECURITY.md`](SECURITY.md) for scope and vulnerability reporting.
+
+## Build and test
+
+```shell
 npm install
-```
-
-Install foundry:
-```shell script
-curl -L https://foundry.paradigm.xyz | bash
-foundryup
 forge install --no-git foundry-rs/forge-std@v1.7.3
+forge test --match-path 'test/FinalLayer*.t.sol'
 ```
 
-Install poetry:
-```shell script
-curl -sSL https://install.python-poetry.org | python3 -
-poetry install
-```
-
-Tips: You can manage multi version of Node:
-```Shell
-## Install nvm and node
-curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.2/install.sh | bash
-nvm install 18.17.0 && nvm use 18.17.0
-```
-
-## Unit test
-
-You can get a free archive node endpoint from https://nodereal.io/.
-
-Run forge test:
-```shell script
-forge test --fork-url ${archive_node_rpc}
-```
-
-## Flatten all system contracts
-
-```shell script
-bash scripts/flatten.sh
-```
-
-All system contracts will be flattened and output into `${workspace}/contracts/flattened/`.
-
-## How to generate genesis file
-
-1. Edit `init_holders.js` file to alloc the initial BNB holder.
-2. Edit `validators.js` file to alloc the initial validator set.
-3. Edit system contracts setting as needed.
-4. Run `node scripts/generate-genesis.js` will generate genesis.json
-
-## How to generate mainnet/testnet/dev genesis file
-
-```shell 
-# build mainnet genesis file & clean
-npm run generate:mainnet && poetry run python -m scripts.generate recover
-
-# build testnet genesis file & clean
-npm run generate:testnet && poetry run python -m scripts.generate recover
-
-# build local dev-net genesis file & clean
-npm run generate:dev && poetry run python -m scripts.generate recover
-```
-Check the `genesis.json` file, and you can get the exact compiled bytecode for different network.
-(`poetry run python -m scripts.generate --help ` for more details)
-```
-# you can verify the bytecode in genesis.json with solc, take ./contracts/StakeHub.sol for example:
-solc-select use 0.8.17
-solc --optimize --optimize-runs 200 --abi --metadata-hash none --bin-runtime ./contracts/StakeHub.sol --base-path . --include-path ./node_modules/ -o output
-```
-
-You can refer to `generate:dev` in `package.json` for more details about how to custom params for local dev-net.
-
-## update ABI files
-
-```bash
-forge inspect {{contract}} abi > abi/{{contract}}.abi
-```
-
-## How to update contract interface for test
-
-```shell script
-// get metadata
-forge build
-
-// generate interface
-cast interface ${workspace}/out/{contract_name}.sol/${contract_name}.json -p ^0.8.0 -n ${contract_name} > ${workspace}/test/utils/interface/I${contract_name}.sol
-```
-
-## BEP-171 unlock bot
-```shell script
-npm install ts-node -g
-
-cp .env.example .env
-# set UNLOCK_RECEIVER, OPERATOR_PRIVATE_KEY to .env
-
-ts-node scripts/bep171-unlock-bot.ts 
-```
+The genesis allocation is produced from these contracts by `make_genesis.py` in
+[fl-network](https://github.com/FinalLayerBlockchain/fl-network).
 
 ## License
 
-The library is licensed under the [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0),
-also included in our repository in the [LICENSE](LICENSE) file.
+Apache 2.0, as upstream (see `LICENCE`). The upstream README is kept as
+[`README.bsc.md`](README.bsc.md).
