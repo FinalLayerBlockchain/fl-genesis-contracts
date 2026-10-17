@@ -34,7 +34,7 @@ The file-by-file map is in [`docs/FINAL-LAYER-CHANGES.md`](docs/FINAL-LAYER-CHAN
 
 ```shell
 npm install
-git clone --depth 1 --branch v1.7.3 https://github.com/foundry-rs/forge-std lib/forge-std
+git clone --depth 1 --recurse-submodules --shallow-submodules --branch v1.7.3 https://github.com/foundry-rs/forge-std lib/forge-std
 forge test --match-path 'test/FinalLayer*.t.sol'
 ```
 
